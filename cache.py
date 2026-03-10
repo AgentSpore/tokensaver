@@ -139,3 +139,39 @@ async def record_compression(db: aiosqlite.Connection, original_tokens: int, com
         (saved, ratio),
     )
     await db.commit()
+
+async def purge_cache(
+    db: aiosqlite.Connection,
+    older_than_days: int = 30,
+    model: str | None = None,
+) -> int:
+    """Delete cache entries not accessed in older_than_days. Optionally filter by model."""
+    cutoff = f"datetime('now', '-{older_than_days} days')"
+    q = f"DELETE FROM cache WHERE last_hit < {cutoff}"
+    params: list = []
+    if model is not None:
+        q += " AND model = ?"
+        params.append(model)
+    cur = await db.execute(q, params)
+    await db.commit()
+    return cur.rowcount
+
+
+async def get_cache_entry(db: aiosqlite.Connection, prompt_hash_prefix: str) -> dict | None:
+    """Fetch a single cache entry by hash prefix."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM cache WHERE prompt_hash LIKE ?", (prompt_hash_prefix + "%",)
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "prompt_hash": r["prompt_hash"][:16],
+        "prompt_preview": r["prompt_preview"],
+        "response": r["response"],
+        "model": r["model"],
+        "tokens_saved": r["tokens_saved"],
+        "hits": r["hits"],
+        "created_at": r["created_at"],
+        "last_hit": r["last_hit"],
+    }
