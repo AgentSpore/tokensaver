@@ -5,7 +5,7 @@ from typing import Optional
 
 class CompressRequest(BaseModel):
     prompt: str = Field(..., description="Original prompt text")
-    max_ratio: float = Field(0.5, ge=0.1, le=1.0, description="Target compression ratio (0.5 = keep 50% of tokens)")
+    max_ratio: float = Field(0.5, ge=0.1, le=1.0, description="Target compression ratio (0.5 = keep 50%)")
     preserve_code: bool = Field(True, description="Preserve code blocks verbatim")
 
 
@@ -31,7 +31,7 @@ class CacheEntry(BaseModel):
 class BatchItem(BaseModel):
     id: str = Field(..., description="Client-supplied request ID")
     prompt: str
-    model: str = Field("gpt-4o-mini", description="Target model identifier")
+    model: str = Field("gpt-4o-mini")
     max_tokens: int = Field(512, ge=1, le=8192)
 
 
@@ -42,7 +42,7 @@ class BatchRequest(BaseModel):
 
 class BatchResultItem(BaseModel):
     id: str
-    status: str  # "ok" | "deduped" | "cached"
+    status: str
     response: Optional[str] = None
     tokens_used: int = 0
     tokens_saved: int = 0
@@ -68,10 +68,21 @@ class UsageStats(BaseModel):
 
 
 class CachePurgeRequest(BaseModel):
-    older_than_days: int = Field(30, ge=1, description="Remove entries not accessed in this many days")
-    model: Optional[str] = Field(None, description="Only purge entries for a specific model (omit = all models)")
+    older_than_days: int = Field(30, ge=1)
+    model: Optional[str] = Field(None, description="Only purge entries for a specific model")
 
 
 class CachePurgeResponse(BaseModel):
     purged: int
     message: str
+
+
+class DailyStatsEntry(BaseModel):
+    day: str
+    model: str
+    compressions: int
+    cache_hits: int
+    cache_misses: int
+    tokens_saved: int
+    tokens_used: int
+    estimated_cost_saved_usd: float
