@@ -65,3 +65,13 @@ class UsageStats(BaseModel):
     compression_requests: int
     avg_compression_ratio: float
     estimated_cost_saved_usd: float
+
+
+class CachePurgeRequest(BaseModel):
+    older_than_days: int = Field(30, ge=1, description="Remove entries not accessed in this many days")
+    model: Optional[str] = Field(None, description="Only purge entries for a specific model (omit = all models)")
+
+
+class CachePurgeResponse(BaseModel):
+    purged: int
+    message: str
