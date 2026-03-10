@@ -9,11 +9,13 @@ from models import (
     CompressRequest, CompressResponse,
     BatchRequest, BatchResponse, BatchResultItem,
     UsageStats, CachePurgeRequest, CachePurgeResponse,
+    DailyStatsEntry,
 )
 from compressor import compress_prompt, estimate_tokens
 from cache import (
     init_db, cache_get, cache_set, cache_list, cache_delete,
     get_cache_entry, purge_cache, get_stats, record_compression,
+    get_daily_stats,
 )
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
@@ -28,8 +30,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TokenSaver",
-    description="LLM API cost optimizer: prompt compression, semantic caching, batch deduplication.",
-    version="0.2.0",
+    description="LLM API cost optimizer: prompt compression, semantic caching, batch deduplication, daily cost analytics.",
+    version="0.3.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -37,7 +39,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
@@ -64,7 +66,6 @@ async def list_cache(limit: int = Query(50, ge=1, le=500)):
 
 @app.get("/cache/{prompt_hash}")
 async def get_cache(prompt_hash: str):
-    """Look up a single cache entry by its hash prefix (first 8+ chars)."""
     entry = await get_cache_entry(app.state.db, prompt_hash)
     if not entry:
         raise HTTPException(404, "Cache entry not found")
@@ -95,10 +96,6 @@ async def store_cache(
 
 @app.post("/cache/purge", response_model=CachePurgeResponse)
 async def purge_cache_endpoint(req: CachePurgeRequest):
-    """
-    Purge stale cache entries not accessed in older_than_days days.
-    Optionally scope purge to a specific model. Returns count of deleted entries.
-    """
     count = await purge_cache(app.state.db, req.older_than_days, req.model)
     model_note = f" for model '{req.model}'" if req.model else ""
     return CachePurgeResponse(
@@ -161,6 +158,17 @@ async def batch_process(req: BatchRequest):
         deduped_count=deduped,
         cached_count=cached,
     )
+
+
+# ── Stats ────────────────────────────────────────────────────────────────────
+
+@app.get("/stats/daily", response_model=list[DailyStatsEntry])
+async def daily_stats(
+    days: int = Query(30, ge=1, le=365, description="Look-back window in days"),
+    model: str | None = Query(None, description="Filter by model name"),
+):
+    """Daily breakdown of token usage, savings, cache performance. For cost dashboards."""
+    return await get_daily_stats(app.state.db, days, model)
 
 
 @app.get("/stats", response_model=UsageStats)
