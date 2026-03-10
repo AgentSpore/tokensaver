@@ -8,10 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from models import (
     CompressRequest, CompressResponse,
     BatchRequest, BatchResponse, BatchResultItem,
-    UsageStats,
+    UsageStats, CachePurgeRequest, CachePurgeResponse,
 )
 from compressor import compress_prompt, estimate_tokens
-from cache import init_db, cache_get, cache_set, cache_list, cache_delete, get_stats, record_compression
+from cache import (
+    init_db, cache_get, cache_set, cache_list, cache_delete,
+    get_cache_entry, purge_cache, get_stats, record_compression,
+)
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
 
@@ -26,7 +29,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TokenSaver",
     description="LLM API cost optimizer: prompt compression, semantic caching, batch deduplication.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -34,15 +37,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": "0.2.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
 async def compress(req: CompressRequest):
-    """
-    Compress a prompt to reduce token count.
-    Returns original + compressed text with token savings breakdown.
-    """
     original_tokens = estimate_tokens(req.prompt)
     compressed = compress_prompt(req.prompt, req.max_ratio, req.preserve_code)
     compressed_tokens = estimate_tokens(compressed)
@@ -60,8 +59,16 @@ async def compress(req: CompressRequest):
 
 @app.get("/cache", response_model=list[dict])
 async def list_cache(limit: int = Query(50, ge=1, le=500)):
-    """List cached prompt/response pairs, sorted by hit count."""
     return await cache_list(app.state.db, limit)
+
+
+@app.get("/cache/{prompt_hash}")
+async def get_cache(prompt_hash: str):
+    """Look up a single cache entry by its hash prefix (first 8+ chars)."""
+    entry = await get_cache_entry(app.state.db, prompt_hash)
+    if not entry:
+        raise HTTPException(404, "Cache entry not found")
+    return entry
 
 
 @app.post("/cache/lookup")
@@ -69,10 +76,6 @@ async def lookup_cache(
     prompt: str = Body(..., embed=True),
     model: str = Body("", embed=True),
 ):
-    """
-    Check if a prompt is cached. Returns cached response or null.
-    Use this before sending to LLM API to avoid redundant calls.
-    """
     entry = await cache_get(app.state.db, prompt, model)
     if not entry:
         return {"hit": False, "response": None}
@@ -86,26 +89,33 @@ async def store_cache(
     response: str = Body(..., embed=True),
     tokens_used: int = Body(0, embed=True),
 ):
-    """Store an LLM response in cache for future reuse."""
     h = await cache_set(app.state.db, prompt, model, response, tokens_used)
     return {"cached": True, "prompt_hash": h[:16]}
 
 
+@app.post("/cache/purge", response_model=CachePurgeResponse)
+async def purge_cache_endpoint(req: CachePurgeRequest):
+    """
+    Purge stale cache entries not accessed in older_than_days days.
+    Optionally scope purge to a specific model. Returns count of deleted entries.
+    """
+    count = await purge_cache(app.state.db, req.older_than_days, req.model)
+    model_note = f" for model '{req.model}'" if req.model else ""
+    return CachePurgeResponse(
+        purged=count,
+        message=f"Removed {count} cache entr{'y' if count == 1 else 'ies'} not accessed in {req.older_than_days}+ days{model_note}.",
+    )
+
+
 @app.delete("/cache/{prompt_hash}")
 async def delete_cache_entry(prompt_hash: str):
-    """Delete a cache entry by its hash prefix."""
     await cache_delete(app.state.db, prompt_hash)
     return {"deleted": True}
 
 
 @app.post("/batch", response_model=BatchResponse)
 async def batch_process(req: BatchRequest):
-    """
-    Process a batch of LLM requests with deduplication + caching.
-    Identical prompts are collapsed — only one real call needed.
-    Returns mock responses (wire up your LLM client to replace simulate_llm).
-    """
-    seen_prompts: dict[str, str] = {}  # prompt -> first id
+    seen_prompts: dict[str, str] = {}
     results: list[BatchResultItem] = []
     total_used = 0
     total_saved = 0
@@ -113,7 +123,6 @@ async def batch_process(req: BatchRequest):
     cached = 0
 
     for item in req.items:
-        # 1. Cache lookup
         hit = await cache_get(app.state.db, item.prompt, item.model)
         if hit:
             results.append(BatchResultItem(
@@ -125,7 +134,6 @@ async def batch_process(req: BatchRequest):
             cached += 1
             continue
 
-        # 2. Dedup within batch
         if req.dedup and item.prompt in seen_prompts:
             results.append(BatchResultItem(
                 id=item.id, status="deduped",
@@ -136,7 +144,6 @@ async def batch_process(req: BatchRequest):
             deduped += 1
             continue
 
-        # 3. Simulate LLM call (in production: call your LLM provider here)
         mock_response = f"[Mock LLM response for: {item.prompt[:60]}...]"
         tokens = estimate_tokens(item.prompt) + item.max_tokens // 2
         await cache_set(app.state.db, item.prompt, item.model, mock_response, tokens)
@@ -158,5 +165,4 @@ async def batch_process(req: BatchRequest):
 
 @app.get("/stats", response_model=UsageStats)
 async def usage_stats():
-    """Cumulative token savings, cache hit rate, and estimated cost saved."""
     return await get_stats(app.state.db)
