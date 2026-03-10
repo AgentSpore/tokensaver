@@ -28,6 +28,18 @@ CREATE TABLE IF NOT EXISTS stats (
 );
 
 INSERT OR IGNORE INTO stats (id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS daily_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    compressions INTEGER NOT NULL DEFAULT 0,
+    cache_hits INTEGER NOT NULL DEFAULT 0,
+    cache_misses INTEGER NOT NULL DEFAULT 0,
+    tokens_saved INTEGER NOT NULL DEFAULT 0,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(day, model)
+);
 """
 
 
@@ -43,15 +55,36 @@ def _hash(prompt: str, model: str = "") -> str:
     return hashlib.sha256(f"{model}:{prompt}".encode()).hexdigest()
 
 
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+async def _bump_daily(db: aiosqlite.Connection, model: str, **increments: int):
+    day = _today()
+    m = model or ""
+    await db.execute(
+        """INSERT INTO daily_log (day, model, compressions, cache_hits, cache_misses, tokens_saved, tokens_used)
+           VALUES (?, ?, 0, 0, 0, 0, 0)
+           ON CONFLICT(day, model) DO NOTHING""",
+        (day, m),
+    )
+    sets = ", ".join(f"{k} = {k} + ?" for k in increments)
+    vals = list(increments.values()) + [day, m]
+    await db.execute(f"UPDATE daily_log SET {sets} WHERE day = ? AND model = ?", vals)
+
+
 async def cache_get(db: aiosqlite.Connection, prompt: str, model: str = "") -> dict | None:
     h = _hash(prompt, model)
     rows = await db.execute_fetchall("SELECT * FROM cache WHERE prompt_hash = ?", (h,))
     if not rows:
+        await _bump_daily(db, model, cache_misses=1)
+        await db.commit()
         return None
     row = rows[0]
     now = datetime.now(timezone.utc).isoformat()
     await db.execute("UPDATE cache SET hits = hits + 1, last_hit = ? WHERE prompt_hash = ?", (now, h))
     await db.execute("UPDATE stats SET cache_hits = cache_hits + 1 WHERE id = 1")
+    await _bump_daily(db, model, cache_hits=1, tokens_saved=row["tokens_saved"])
     await db.commit()
     return {
         "prompt_hash": row["prompt_hash"],
@@ -75,6 +108,7 @@ async def cache_set(db: aiosqlite.Connection, prompt: str, model: str, response:
         (h, preview, response, model, tokens_used, now, now),
     )
     await db.execute("UPDATE stats SET total_tokens_used = total_tokens_used + ? WHERE id = 1", (tokens_used,))
+    await _bump_daily(db, model, tokens_used=tokens_used)
     await db.commit()
     return h
 
@@ -107,12 +141,10 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     s = rows[0]
     cache_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM cache")
     cache_count = cache_rows[0]["cnt"] if cache_rows else 0
-    total = s["total_tokens_used"] + s["total_tokens_saved"]
     avg_ratio = (
         round(s["sum_compression_ratio"] / s["compression_requests"], 3)
         if s["compression_requests"] > 0 else 1.0
     )
-    # Rough cost estimate: $0.15 per 1M input tokens (gpt-4o-mini price)
     estimated_saved = round(s["total_tokens_saved"] * 0.15 / 1_000_000, 6)
     return {
         "total_requests": s["total_requests"],
@@ -138,14 +170,15 @@ async def record_compression(db: aiosqlite.Connection, original_tokens: int, com
            WHERE id = 1""",
         (saved, ratio),
     )
+    await _bump_daily(db, "", compressions=1, tokens_saved=saved)
     await db.commit()
+
 
 async def purge_cache(
     db: aiosqlite.Connection,
     older_than_days: int = 30,
     model: str | None = None,
 ) -> int:
-    """Delete cache entries not accessed in older_than_days. Optionally filter by model."""
     cutoff = f"datetime('now', '-{older_than_days} days')"
     q = f"DELETE FROM cache WHERE last_hit < {cutoff}"
     params: list = []
@@ -158,7 +191,6 @@ async def purge_cache(
 
 
 async def get_cache_entry(db: aiosqlite.Connection, prompt_hash_prefix: str) -> dict | None:
-    """Fetch a single cache entry by hash prefix."""
     rows = await db.execute_fetchall(
         "SELECT * FROM cache WHERE prompt_hash LIKE ?", (prompt_hash_prefix + "%",)
     )
@@ -175,3 +207,32 @@ async def get_cache_entry(db: aiosqlite.Connection, prompt_hash_prefix: str) -> 
         "created_at": r["created_at"],
         "last_hit": r["last_hit"],
     }
+
+
+async def get_daily_stats(
+    db: aiosqlite.Connection,
+    days: int = 30,
+    model: str | None = None,
+) -> list[dict]:
+    q = "SELECT * FROM daily_log WHERE day >= date('now', ?)"
+    params: list = [f"-{days} days"]
+    if model:
+        q += " AND model = ?"
+        params.append(model)
+    q += " ORDER BY day DESC, model ASC"
+    rows = await db.execute_fetchall(q, params)
+    result = []
+    for r in rows:
+        tokens_saved = r["tokens_saved"]
+        estimated_usd = round(tokens_saved * 0.15 / 1_000_000, 6)
+        result.append({
+            "day": r["day"],
+            "model": r["model"] or "(all)",
+            "compressions": r["compressions"],
+            "cache_hits": r["cache_hits"],
+            "cache_misses": r["cache_misses"],
+            "tokens_saved": tokens_saved,
+            "tokens_used": r["tokens_used"],
+            "estimated_cost_saved_usd": estimated_usd,
+        })
+    return result
