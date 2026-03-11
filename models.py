@@ -56,6 +56,27 @@ class BatchResponse(BaseModel):
     cached_count: int
 
 
+class ModelCostCreate(BaseModel):
+    name: str = Field(..., description="Model name, e.g. gpt-4o, claude-sonnet-4-20250514")
+    input_cost_per_1m: float = Field(..., ge=0, description="Cost per 1M input tokens in USD")
+    output_cost_per_1m: float = Field(..., ge=0, description="Cost per 1M output tokens in USD")
+    description: Optional[str] = None
+
+
+class ModelCostUpdate(BaseModel):
+    input_cost_per_1m: Optional[float] = Field(None, ge=0)
+    output_cost_per_1m: Optional[float] = Field(None, ge=0)
+    description: Optional[str] = None
+
+
+class ModelCostResponse(BaseModel):
+    name: str
+    input_cost_per_1m: float
+    output_cost_per_1m: float
+    description: Optional[str]
+    created_at: str
+
+
 class UsageStats(BaseModel):
     total_requests: int
     total_tokens_saved: int
@@ -65,6 +86,7 @@ class UsageStats(BaseModel):
     compression_requests: int
     avg_compression_ratio: float
     estimated_cost_saved_usd: float
+    registered_models: int
 
 
 class CachePurgeRequest(BaseModel):
