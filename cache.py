@@ -40,7 +40,17 @@ CREATE TABLE IF NOT EXISTS daily_log (
     tokens_used INTEGER NOT NULL DEFAULT 0,
     UNIQUE(day, model)
 );
+
+CREATE TABLE IF NOT EXISTS model_costs (
+    name TEXT PRIMARY KEY,
+    input_cost_per_1m REAL NOT NULL DEFAULT 0.15,
+    output_cost_per_1m REAL NOT NULL DEFAULT 0.60,
+    description TEXT,
+    created_at TEXT NOT NULL
+);
 """
+
+DEFAULT_COST_PER_1M = 0.15
 
 
 async def init_db(path: str) -> aiosqlite.Connection:
@@ -59,6 +69,16 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+async def _get_model_cost(db: aiosqlite.Connection, model: str) -> float:
+    """Get input cost per 1M tokens for a model, fallback to default."""
+    if not model:
+        return DEFAULT_COST_PER_1M
+    rows = await db.execute_fetchall("SELECT input_cost_per_1m FROM model_costs WHERE name = ?", (model,))
+    if rows:
+        return rows[0]["input_cost_per_1m"]
+    return DEFAULT_COST_PER_1M
+
+
 async def _bump_daily(db: aiosqlite.Connection, model: str, **increments: int):
     day = _today()
     m = model or ""
@@ -72,6 +92,60 @@ async def _bump_daily(db: aiosqlite.Connection, model: str, **increments: int):
     vals = list(increments.values()) + [day, m]
     await db.execute(f"UPDATE daily_log SET {sets} WHERE day = ? AND model = ?", vals)
 
+
+# ── Model Costs ──────────────────────────────────────────────────────────────
+
+async def create_model_cost(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO model_costs (name, input_cost_per_1m, output_cost_per_1m, description, created_at) VALUES (?, ?, ?, ?, ?)",
+            (data["name"], data["input_cost_per_1m"], data["output_cost_per_1m"], data.get("description"), now),
+        )
+    except aiosqlite.IntegrityError:
+        raise ValueError(f"Model '{data['name']}' already registered")
+    await db.commit()
+    return await get_model_cost(db, data["name"])
+
+
+async def list_model_costs(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM model_costs ORDER BY name ASC")
+    return [_model_cost_row(r) for r in rows]
+
+
+async def get_model_cost(db: aiosqlite.Connection, name: str) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM model_costs WHERE name = ?", (name,))
+    return _model_cost_row(rows[0]) if rows else None
+
+
+async def update_model_cost(db: aiosqlite.Connection, name: str, updates: dict) -> dict | None:
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return await get_model_cost(db, name)
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [name]
+    cur = await db.execute(f"UPDATE model_costs SET {set_clause} WHERE name = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_model_cost(db, name)
+
+
+async def delete_model_cost(db: aiosqlite.Connection, name: str) -> bool:
+    cur = await db.execute("DELETE FROM model_costs WHERE name = ?", (name,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+def _model_cost_row(r: aiosqlite.Row) -> dict:
+    return {
+        "name": r["name"], "input_cost_per_1m": r["input_cost_per_1m"],
+        "output_cost_per_1m": r["output_cost_per_1m"],
+        "description": r["description"], "created_at": r["created_at"],
+    }
+
+
+# ── Cache ────────────────────────────────────────────────────────────────────
 
 async def cache_get(db: aiosqlite.Connection, prompt: str, model: str = "") -> dict | None:
     h = _hash(prompt, model)
@@ -141,11 +215,14 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     s = rows[0]
     cache_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM cache")
     cache_count = cache_rows[0]["cnt"] if cache_rows else 0
+    model_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM model_costs")
+    model_count = model_rows[0]["cnt"] if model_rows else 0
     avg_ratio = (
         round(s["sum_compression_ratio"] / s["compression_requests"], 3)
         if s["compression_requests"] > 0 else 1.0
     )
-    estimated_saved = round(s["total_tokens_saved"] * 0.15 / 1_000_000, 6)
+    # Use model-aware cost calculation
+    estimated_saved = await _calculate_total_cost_saved(db, s["total_tokens_saved"])
     return {
         "total_requests": s["total_requests"],
         "total_tokens_saved": s["total_tokens_saved"],
@@ -155,7 +232,24 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "compression_requests": s["compression_requests"],
         "avg_compression_ratio": avg_ratio,
         "estimated_cost_saved_usd": estimated_saved,
+        "registered_models": model_count,
     }
+
+
+async def _calculate_total_cost_saved(db: aiosqlite.Connection, total_tokens: int) -> float:
+    """Calculate cost using per-model rates from cache entries, fallback to default."""
+    rows = await db.execute_fetchall(
+        "SELECT model, SUM(tokens_saved * (hits + 1)) as total_saved FROM cache GROUP BY model"
+    )
+    if not rows:
+        return round(total_tokens * DEFAULT_COST_PER_1M / 1_000_000, 6)
+    total_cost = 0.0
+    for r in rows:
+        model = r["model"] or ""
+        saved = r["total_saved"] or 0
+        cost_per_1m = await _get_model_cost(db, model)
+        total_cost += saved * cost_per_1m / 1_000_000
+    return round(total_cost, 6)
 
 
 async def record_compression(db: aiosqlite.Connection, original_tokens: int, compressed_tokens: int):
@@ -224,7 +318,9 @@ async def get_daily_stats(
     result = []
     for r in rows:
         tokens_saved = r["tokens_saved"]
-        estimated_usd = round(tokens_saved * 0.15 / 1_000_000, 6)
+        m = r["model"] or ""
+        cost_per_1m = await _get_model_cost(db, m)
+        estimated_usd = round(tokens_saved * cost_per_1m / 1_000_000, 6)
         result.append({
             "day": r["day"],
             "model": r["model"] or "(all)",

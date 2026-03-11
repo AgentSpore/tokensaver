@@ -10,12 +10,14 @@ from models import (
     BatchRequest, BatchResponse, BatchResultItem,
     UsageStats, CachePurgeRequest, CachePurgeResponse,
     DailyStatsEntry,
+    ModelCostCreate, ModelCostUpdate, ModelCostResponse,
 )
 from compressor import compress_prompt, estimate_tokens
 from cache import (
     init_db, cache_get, cache_set, cache_list, cache_delete,
     get_cache_entry, purge_cache, get_stats, record_compression,
     get_daily_stats,
+    create_model_cost, list_model_costs, get_model_cost, update_model_cost, delete_model_cost,
 )
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
@@ -30,8 +32,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TokenSaver",
-    description="LLM API cost optimizer: prompt compression, semantic caching, batch deduplication, daily cost analytics.",
-    version="0.3.0",
+    description="LLM API cost optimizer: prompt compression, semantic caching, batch deduplication, model cost profiles.",
+    version="0.4.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -39,7 +41,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.4.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
@@ -58,6 +60,46 @@ async def compress(req: CompressRequest):
         compression_ratio=round(compressed_tokens / max(original_tokens, 1), 3),
     )
 
+
+# ── Model Cost Profiles ─────────────────────────────────────────────────────
+
+@app.post("/models", response_model=ModelCostResponse, status_code=201)
+async def add_model(body: ModelCostCreate):
+    try:
+        return await create_model_cost(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/models", response_model=list[ModelCostResponse])
+async def get_models():
+    return await list_model_costs(app.state.db)
+
+
+@app.get("/models/{name}", response_model=ModelCostResponse)
+async def get_model_detail(name: str):
+    m = await get_model_cost(app.state.db, name)
+    if not m:
+        raise HTTPException(404, "Model not found")
+    return m
+
+
+@app.patch("/models/{name}", response_model=ModelCostResponse)
+async def patch_model(name: str, body: ModelCostUpdate):
+    m = await update_model_cost(app.state.db, name, body.model_dump(exclude_unset=True))
+    if not m:
+        raise HTTPException(404, "Model not found")
+    return m
+
+
+@app.delete("/models/{name}", status_code=204)
+async def remove_model(name: str):
+    ok = await delete_model_cost(app.state.db, name)
+    if not ok:
+        raise HTTPException(404, "Model not found")
+
+
+# ── Cache ────────────────────────────────────────────────────────────────────
 
 @app.get("/cache", response_model=list[dict])
 async def list_cache(limit: int = Query(50, ge=1, le=500)):
@@ -167,7 +209,7 @@ async def daily_stats(
     days: int = Query(30, ge=1, le=365, description="Look-back window in days"),
     model: str | None = Query(None, description="Filter by model name"),
 ):
-    """Daily breakdown of token usage, savings, cache performance. For cost dashboards."""
+    """Daily breakdown of token usage, savings, cache performance. Uses model-specific pricing."""
     return await get_daily_stats(app.state.db, days, model)
 
 
