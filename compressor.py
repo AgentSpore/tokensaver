@@ -7,14 +7,20 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def compress_prompt(prompt: str, max_ratio: float = 0.5, preserve_code: bool = True) -> str:
+def compress_prompt(
+    prompt: str,
+    max_ratio: float = 0.5,
+    preserve_code: bool = True,
+    strip_examples: bool = False,
+    strip_comments: bool = False,
+) -> str:
     """
     Lightweight prompt compressor that:
     1. Strips redundant whitespace
     2. Removes verbose filler phrases
-    3. Condenses repeated patterns
-    4. Abbreviates common instructions
-    (Real production: use LLMLingua / selective context removal)
+    3. Optionally strips examples and comments
+    4. Condenses repeated patterns
+    5. Abbreviates common instructions
     """
     # Step 0: preserve code blocks
     code_blocks: list[str] = []
@@ -24,11 +30,23 @@ def compress_prompt(prompt: str, max_ratio: float = 0.5, preserve_code: bool = T
             return f"__CODE_{len(code_blocks) - 1}__"
         prompt = re.sub(r"```[\s\S]*?```", _store_code, prompt)
 
-    # Step 1: normalise whitespace
+    # Step 1: strip examples (e.g. "Example:", "For example, ...", "e.g., ...")
+    if strip_examples:
+        prompt = re.sub(
+            r"(?:^|\n)\s*(?:example|for example|e\.g\.)[:\s].*?(?=\n\S|\n\n|\Z)",
+            "", prompt, flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    # Step 2: strip code comments (// and # style)
+    if strip_comments:
+        prompt = re.sub(r"(?m)^\s*(?://|#)\s.*$", "", prompt)
+        prompt = re.sub(r"\s+(?://|#)\s.*$", "", prompt, flags=re.MULTILINE)
+
+    # Step 3: normalise whitespace
     compressed = re.sub(r"[ \t]+", " ", prompt)
     compressed = re.sub(r"\n{3,}", "\n\n", compressed)
 
-    # Step 2: remove filler phrases
+    # Step 4: remove filler phrases
     fillers = [
         r"\bplease\b\s*",
         r"\bcould you\b\s*(please)?\s*",
@@ -46,15 +64,14 @@ def compress_prompt(prompt: str, max_ratio: float = 0.5, preserve_code: bool = T
     for pattern in fillers:
         compressed = re.sub(pattern, "", compressed, flags=re.IGNORECASE)
 
-    # Step 3: condense repeated whitespace again after removal
+    # Step 5: condense repeated whitespace again after removal
     compressed = re.sub(r"[ \t]+", " ", compressed).strip()
 
-    # Step 4: if still above ratio, truncate from middle (keep start + end context)
+    # Step 6: if still above ratio, truncate from middle (keep start + end context)
     original_tokens = estimate_tokens(prompt)
     target_tokens = int(original_tokens * max_ratio)
     current_tokens = estimate_tokens(compressed)
     if current_tokens > target_tokens:
-        # Keep first 60% and last 40% of target
         chars_target = target_tokens * 4
         keep_start = int(chars_target * 0.6)
         keep_end = int(chars_target * 0.4)
