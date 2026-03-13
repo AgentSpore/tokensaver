@@ -7,6 +7,7 @@ class CompressRequest(BaseModel):
     prompt: str = Field(..., description="Original prompt text")
     max_ratio: float = Field(0.5, ge=0.1, le=1.0, description="Target compression ratio (0.5 = keep 50%)")
     preserve_code: bool = Field(True, description="Preserve code blocks verbatim")
+    profile: Optional[str] = Field(None, description="Named compression profile to apply (overrides max_ratio)")
 
 
 class CompressResponse(BaseModel):
@@ -16,6 +17,7 @@ class CompressResponse(BaseModel):
     compressed_tokens: int
     savings_pct: float
     compression_ratio: float
+    profile_used: Optional[str] = None
 
 
 class CacheEntry(BaseModel):
@@ -108,3 +110,60 @@ class DailyStatsEntry(BaseModel):
     tokens_saved: int
     tokens_used: int
     estimated_cost_saved_usd: float
+
+
+# ── Compression Profiles ─────────────────────────────────────────────────────
+
+class ProfileCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64, description="Profile name")
+    max_ratio: float = Field(0.5, ge=0.1, le=1.0, description="Target compression ratio")
+    preserve_code: bool = Field(True, description="Preserve code blocks")
+    strip_examples: bool = Field(False, description="Remove example blocks from prompt")
+    strip_comments: bool = Field(False, description="Remove code comments")
+    description: Optional[str] = None
+
+
+class ProfileUpdate(BaseModel):
+    max_ratio: Optional[float] = Field(None, ge=0.1, le=1.0)
+    preserve_code: Optional[bool] = None
+    strip_examples: Optional[bool] = None
+    strip_comments: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class ProfileResponse(BaseModel):
+    name: str
+    max_ratio: float
+    preserve_code: bool
+    strip_examples: bool
+    strip_comments: bool
+    builtin: bool
+    description: Optional[str]
+    created_at: str
+
+
+# ── Cache Analytics ──────────────────────────────────────────────────────────
+
+class CacheAnalyticsResponse(BaseModel):
+    total_entries: int
+    total_hits: int
+    overall_hit_rate: float
+    avg_hits_per_entry: float
+    top_entries: list[CacheTopEntry]
+    model_breakdown: list[CacheModelBreakdown]
+
+
+class CacheTopEntry(BaseModel):
+    prompt_hash: str
+    prompt_preview: str
+    model: str
+    hits: int
+    tokens_saved: int
+    last_hit: str
+
+
+class CacheModelBreakdown(BaseModel):
+    model: str
+    entries: int
+    total_hits: int
+    total_tokens_saved: int

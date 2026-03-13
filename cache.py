@@ -1,5 +1,7 @@
 from __future__ import annotations
+import csv
 import hashlib
+import io
 from datetime import datetime, timezone
 import aiosqlite
 
@@ -48,7 +50,24 @@ CREATE TABLE IF NOT EXISTS model_costs (
     description TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS profiles (
+    name TEXT PRIMARY KEY,
+    max_ratio REAL NOT NULL DEFAULT 0.5,
+    preserve_code INTEGER NOT NULL DEFAULT 1,
+    strip_examples INTEGER NOT NULL DEFAULT 0,
+    strip_comments INTEGER NOT NULL DEFAULT 0,
+    builtin INTEGER NOT NULL DEFAULT 0,
+    description TEXT,
+    created_at TEXT NOT NULL
+);
 """
+
+BUILTIN_PROFILES = [
+    ("aggressive", 0.3, 1, 1, 1, 1, "Maximum compression: low ratio, strip examples and comments", "2026-01-01T00:00:00+00:00"),
+    ("balanced", 0.5, 1, 0, 0, 1, "Default balanced compression", "2026-01-01T00:00:00+00:00"),
+    ("minimal", 0.8, 1, 0, 0, 1, "Light compression, preserves most content", "2026-01-01T00:00:00+00:00"),
+]
 
 DEFAULT_COST_PER_1M = 0.15
 
@@ -57,6 +76,13 @@ async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
     db.row_factory = aiosqlite.Row
     await db.executescript(SQL)
+    for p in BUILTIN_PROFILES:
+        await db.execute(
+            """INSERT OR IGNORE INTO profiles
+               (name, max_ratio, preserve_code, strip_examples, strip_comments, builtin, description, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            p,
+        )
     await db.commit()
     return db
 
@@ -70,7 +96,6 @@ def _today() -> str:
 
 
 async def _get_model_cost(db: aiosqlite.Connection, model: str) -> float:
-    """Get input cost per 1M tokens for a model, fallback to default."""
     if not model:
         return DEFAULT_COST_PER_1M
     rows = await db.execute_fetchall("SELECT input_cost_per_1m FROM model_costs WHERE name = ?", (model,))
@@ -91,6 +116,80 @@ async def _bump_daily(db: aiosqlite.Connection, model: str, **increments: int):
     sets = ", ".join(f"{k} = {k} + ?" for k in increments)
     vals = list(increments.values()) + [day, m]
     await db.execute(f"UPDATE daily_log SET {sets} WHERE day = ? AND model = ?", vals)
+
+
+# ── Compression Profiles ─────────────────────────────────────────────────────
+
+async def create_profile(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await db.execute(
+            """INSERT INTO profiles (name, max_ratio, preserve_code, strip_examples, strip_comments, builtin, description, created_at)
+               VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
+            (data["name"], data["max_ratio"], int(data.get("preserve_code", True)),
+             int(data.get("strip_examples", False)), int(data.get("strip_comments", False)),
+             data.get("description"), now),
+        )
+    except aiosqlite.IntegrityError:
+        raise ValueError(f"Profile '{data['name']}' already exists")
+    await db.commit()
+    return await get_profile(db, data["name"])
+
+
+async def list_profiles(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM profiles ORDER BY builtin DESC, name ASC")
+    return [_profile_row(r) for r in rows]
+
+
+async def get_profile(db: aiosqlite.Connection, name: str) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM profiles WHERE name = ?", (name,))
+    return _profile_row(rows[0]) if rows else None
+
+
+async def update_profile(db: aiosqlite.Connection, name: str, updates: dict) -> dict | None:
+    existing = await get_profile(db, name)
+    if not existing:
+        return None
+    if existing["builtin"]:
+        raise ValueError("Cannot modify built-in profiles")
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return existing
+    bool_fields = {"preserve_code", "strip_examples", "strip_comments"}
+    for bf in bool_fields:
+        if bf in fields:
+            fields[bf] = int(fields[bf])
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [name]
+    cur = await db.execute(f"UPDATE profiles SET {set_clause} WHERE name = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_profile(db, name)
+
+
+async def delete_profile(db: aiosqlite.Connection, name: str) -> bool:
+    existing = await get_profile(db, name)
+    if not existing:
+        return False
+    if existing["builtin"]:
+        raise ValueError("Cannot delete built-in profiles")
+    cur = await db.execute("DELETE FROM profiles WHERE name = ? AND builtin = 0", (name,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+def _profile_row(r: aiosqlite.Row) -> dict:
+    return {
+        "name": r["name"],
+        "max_ratio": r["max_ratio"],
+        "preserve_code": bool(r["preserve_code"]),
+        "strip_examples": bool(r["strip_examples"]),
+        "strip_comments": bool(r["strip_comments"]),
+        "builtin": bool(r["builtin"]),
+        "description": r["description"],
+        "created_at": r["created_at"],
+    }
 
 
 # ── Model Costs ──────────────────────────────────────────────────────────────
@@ -221,7 +320,6 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         round(s["sum_compression_ratio"] / s["compression_requests"], 3)
         if s["compression_requests"] > 0 else 1.0
     )
-    # Use model-aware cost calculation
     estimated_saved = await _calculate_total_cost_saved(db, s["total_tokens_saved"])
     return {
         "total_requests": s["total_requests"],
@@ -237,7 +335,6 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
 
 
 async def _calculate_total_cost_saved(db: aiosqlite.Connection, total_tokens: int) -> float:
-    """Calculate cost using per-model rates from cache entries, fallback to default."""
     rows = await db.execute_fetchall(
         "SELECT model, SUM(tokens_saved * (hits + 1)) as total_saved FROM cache GROUP BY model"
     )
@@ -332,3 +429,58 @@ async def get_daily_stats(
             "estimated_cost_saved_usd": estimated_usd,
         })
     return result
+
+
+# ── Cache Analytics ──────────────────────────────────────────────────────────
+
+async def get_cache_analytics(db: aiosqlite.Connection, top_n: int = 10) -> dict:
+    total_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt, COALESCE(SUM(hits), 0) as total_hits FROM cache")
+    total_entries = total_rows[0]["cnt"]
+    total_hits = total_rows[0]["total_hits"]
+    stats_rows = await db.execute_fetchall("SELECT cache_hits FROM stats WHERE id = 1")
+    all_lookups = (stats_rows[0]["cache_hits"] if stats_rows else 0) + total_entries
+    hit_rate = round(total_hits / max(all_lookups, 1) * 100, 1)
+    avg_hits = round(total_hits / max(total_entries, 1), 2)
+    top_rows = await db.execute_fetchall(
+        "SELECT prompt_hash, prompt_preview, model, hits, tokens_saved, last_hit FROM cache ORDER BY hits DESC LIMIT ?",
+        (top_n,),
+    )
+    top_entries = [{
+        "prompt_hash": r["prompt_hash"][:16],
+        "prompt_preview": r["prompt_preview"] or "",
+        "model": r["model"],
+        "hits": r["hits"],
+        "tokens_saved": r["tokens_saved"],
+        "last_hit": r["last_hit"],
+    } for r in top_rows]
+    model_rows = await db.execute_fetchall(
+        "SELECT model, COUNT(*) as entries, COALESCE(SUM(hits), 0) as total_hits, COALESCE(SUM(tokens_saved), 0) as total_saved FROM cache GROUP BY model ORDER BY total_hits DESC"
+    )
+    model_breakdown = [{
+        "model": r["model"] or "(default)",
+        "entries": r["entries"],
+        "total_hits": r["total_hits"],
+        "total_tokens_saved": r["total_saved"],
+    } for r in model_rows]
+    return {
+        "total_entries": total_entries,
+        "total_hits": total_hits,
+        "overall_hit_rate": hit_rate,
+        "avg_hits_per_entry": avg_hits,
+        "top_entries": top_entries,
+        "model_breakdown": model_breakdown,
+    }
+
+
+# ── CSV Export ───────────────────────────────────────────────────────────────
+
+async def export_daily_csv(db: aiosqlite.Connection, days: int = 90, model: str | None = None) -> str:
+    rows = await get_daily_stats(db, days, model)
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        "day", "model", "compressions", "cache_hits", "cache_misses",
+        "tokens_saved", "tokens_used", "estimated_cost_saved_usd",
+    ])
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
