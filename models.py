@@ -1,14 +1,16 @@
-from __future__ import annotations
-from pydantic import BaseModel, Field
-from typing import Optional
+"""TokenSaver v1.0.0 — Pydantic models for LLM cost optimization."""
 
+from __future__ import annotations
+
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+# ── Compression ──────────────────────────────────────────────────────────────
 
 class CompressRequest(BaseModel):
-    prompt: str = Field(..., description="Original prompt text")
-    max_ratio: float = Field(0.5, ge=0.1, le=1.0, description="Target compression ratio (0.5 = keep 50%)")
-    preserve_code: bool = Field(True, description="Preserve code blocks verbatim")
-    profile: Optional[str] = Field(None, description="Named compression profile to apply (overrides max_ratio)")
-    apply_rules: bool = Field(True, description="Apply custom compression rules during compression")
+    prompt: str = Field(description="Prompt text to compress")
+    profile: str = Field("balanced", description="Compression profile name")
 
 
 class CompressResponse(BaseModel):
@@ -16,448 +18,421 @@ class CompressResponse(BaseModel):
     compressed: str
     original_tokens: int
     compressed_tokens: int
-    savings_pct: float
-    compression_ratio: float
-    profile_used: Optional[str] = None
-    rules_applied: int = 0
-
-
-class CacheEntry(BaseModel):
-    prompt_hash: str
-    response: str
-    model: str
-    tokens_saved: int
-    hits: int
-    created_at: str
-    last_hit: str
-
-
-class BatchItem(BaseModel):
-    id: str = Field(..., description="Client-supplied request ID")
-    prompt: str
-    model: str = Field("gpt-4o-mini")
-    max_tokens: int = Field(512, ge=1, le=8192)
-
-
-class BatchRequest(BaseModel):
-    items: list[BatchItem] = Field(..., min_length=1, max_length=50)
-    dedup: bool = Field(True, description="Deduplicate identical prompts before sending")
-
-
-class BatchResultItem(BaseModel):
-    id: str
-    status: str
-    response: Optional[str] = None
-    tokens_used: int = 0
-    tokens_saved: int = 0
-
-
-class BatchResponse(BaseModel):
-    results: list[BatchResultItem]
-    total_tokens_used: int
-    total_tokens_saved: int
-    deduped_count: int
-    cached_count: int
-
-
-class ModelCostCreate(BaseModel):
-    name: str = Field(..., description="Model name, e.g. gpt-4o, claude-sonnet-4-20250514")
-    input_cost_per_1m: float = Field(..., ge=0, description="Cost per 1M input tokens in USD")
-    output_cost_per_1m: float = Field(..., ge=0, description="Cost per 1M output tokens in USD")
-    description: Optional[str] = None
-
-
-class ModelCostUpdate(BaseModel):
-    input_cost_per_1m: Optional[float] = Field(None, ge=0)
-    output_cost_per_1m: Optional[float] = Field(None, ge=0)
-    description: Optional[str] = None
-
-
-class ModelCostResponse(BaseModel):
-    name: str
-    input_cost_per_1m: float
-    output_cost_per_1m: float
-    description: Optional[str]
-    created_at: str
-
-
-class UsageStats(BaseModel):
-    total_requests: int
-    total_tokens_saved: int
-    total_tokens_used: int
-    cache_hits: int
-    cache_entries: int
-    compression_requests: int
-    avg_compression_ratio: float
-    estimated_cost_saved_usd: float
-    registered_models: int
-    total_templates: int
-    compression_history_entries: int
-    total_rules: int
-    total_quotas: int
-    total_alert_rules: int
-    total_ab_experiments: int
-
-
-class CachePurgeRequest(BaseModel):
-    older_than_days: int = Field(30, ge=1)
-    model: Optional[str] = Field(None, description="Only purge entries for a specific model")
-
-
-class CachePurgeResponse(BaseModel):
-    purged: int
-    message: str
-
-
-class DailyStatsEntry(BaseModel):
-    day: str
-    model: str
-    compressions: int
-    cache_hits: int
-    cache_misses: int
-    tokens_saved: int
-    tokens_used: int
-    estimated_cost_saved_usd: float
-
-
-# ── Compression Profiles ─────────────────────────────────────────────────────
-
-class ProfileCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64, description="Profile name")
-    max_ratio: float = Field(0.5, ge=0.1, le=1.0, description="Target compression ratio")
-    preserve_code: bool = Field(True, description="Preserve code blocks")
-    strip_examples: bool = Field(False, description="Remove example blocks from prompt")
-    strip_comments: bool = Field(False, description="Remove code comments")
-    description: Optional[str] = None
-
-
-class ProfileUpdate(BaseModel):
-    max_ratio: Optional[float] = Field(None, ge=0.1, le=1.0)
-    preserve_code: Optional[bool] = None
-    strip_examples: Optional[bool] = None
-    strip_comments: Optional[bool] = None
-    description: Optional[str] = None
-
-
-class ProfileResponse(BaseModel):
-    name: str
-    max_ratio: float
-    preserve_code: bool
-    strip_examples: bool
-    strip_comments: bool
-    builtin: bool
-    description: Optional[str]
-    created_at: str
-
-
-# ── Cache Analytics ──────────────────────────────────────────────────────────
-
-class CacheTopEntry(BaseModel):
-    prompt_hash: str
-    prompt_preview: str
-    model: str
-    hits: int
-    tokens_saved: int
-    last_hit: str
-
-
-class CacheModelBreakdown(BaseModel):
-    model: str
-    entries: int
-    total_hits: int
-    total_tokens_saved: int
-
-
-class CacheAnalyticsResponse(BaseModel):
-    total_entries: int
-    total_hits: int
-    overall_hit_rate: float
-    avg_hits_per_entry: float
-    top_entries: list[CacheTopEntry]
-    model_breakdown: list[CacheModelBreakdown]
-
-
-# ── Cost Estimation ──────────────────────────────────────────────────────────
-
-class CostEstimateRequest(BaseModel):
-    prompt: str = Field(..., description="Prompt text to estimate cost for")
-    model: Optional[str] = Field(None, description="Specific model (or all registered)")
-
-
-class CostEstimateItem(BaseModel):
-    model: str
-    input_tokens: int
-    input_cost_usd: float
-    output_cost_usd_per_1k: float
-    total_estimate_usd: float
-
-
-class CostEstimateResponse(BaseModel):
-    input_tokens: int
-    estimates: list[CostEstimateItem]
-    cheapest_model: Optional[str]
-
-
-# ── Compression Benchmark ───────────────────────────────────────────────────
-
-class BenchmarkRequest(BaseModel):
-    prompt: str = Field(..., description="Prompt to benchmark across all profiles")
-
-
-class BenchmarkResultItem(BaseModel):
+    ratio: float
     profile: str
-    builtin: bool
-    max_ratio: float
+    rules_applied: int
+
+
+class CompressionRecord(BaseModel):
+    id: int
     original_tokens: int
     compressed_tokens: int
-    savings_pct: float
-    compression_ratio: float
-    compressed_preview: str
-
-
-class BenchmarkResponse(BaseModel):
-    original_tokens: int
-    profiles_tested: int
-    results: list[BenchmarkResultItem]
-    best_profile: str
-    best_savings_pct: float
-
-
-# ── Budget Tracking ──────────────────────────────────────────────────────────
-
-class BudgetSetRequest(BaseModel):
-    daily_token_limit: Optional[int] = Field(None, ge=0, description="Daily token budget (null = unlimited)")
-    monthly_token_limit: Optional[int] = Field(None, ge=0, description="Monthly token budget (null = unlimited)")
-    alert_threshold_pct: float = Field(80.0, ge=0, le=100, description="Alert when usage hits this %")
-
-
-class BudgetStatusResponse(BaseModel):
-    daily_token_limit: Optional[int]
-    monthly_token_limit: Optional[int]
-    alert_threshold_pct: float
-    daily_used: int
-    daily_remaining: Optional[int]
-    daily_pct: float
-    monthly_used: int
-    monthly_remaining: Optional[int]
-    monthly_pct: float
-    over_budget: bool
-    alerts: list[str]
-
-
-# ── Prompt Templates ─────────────────────────────────────────────────────────
-
-class PromptTemplateCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100, description="Template name")
-    template_text: str = Field(..., min_length=1, description="Template with {{variable}} placeholders")
-    description: Optional[str] = Field(None, max_length=500)
-
-
-class PromptTemplateUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=100)
-    template_text: Optional[str] = Field(None, min_length=1)
-    description: Optional[str] = Field(None, max_length=500)
-    change_description: Optional[str] = Field(None, max_length=300, description="Description of what changed (stored in version history)")
-
-
-class PromptTemplateResponse(BaseModel):
-    id: int
-    name: str
-    template_text: str
-    variables: list[str]
-    description: Optional[str]
-    times_used: int
-    version: int
-    created_at: str
-
-
-class PromptTemplateRenderRequest(BaseModel):
-    variables: dict[str, str] = Field(..., description="Variable values to substitute, e.g. {'language': 'Python'}")
-    compress: bool = Field(False, description="Compress the rendered prompt")
-    profile: Optional[str] = Field(None, description="Compression profile to use if compress=True")
-
-
-class PromptTemplateRenderResponse(BaseModel):
-    rendered: str
-    rendered_tokens: int
-    compressed: Optional[str] = None
-    compressed_tokens: Optional[int] = None
-    savings_pct: Optional[float] = None
-    missing_variables: list[str]
-
-
-# ── Compression History ──────────────────────────────────────────────────────
-
-class CompressionHistoryEntry(BaseModel):
-    id: int
-    prompt_preview: str
-    profile_used: Optional[str]
-    original_tokens: int
-    compressed_tokens: int
-    compression_ratio: float
-    savings_pct: float
+    ratio: float
+    profile: str
     model: Optional[str]
+    rules_applied: int
     created_at: str
 
 
 class CompressionAnalytics(BaseModel):
     total_compressions: int
+    total_tokens_saved: int
     avg_ratio: float
-    avg_savings_pct: float
     best_ratio: float
     worst_ratio: float
-    by_profile: list[dict]
-    daily_trend: list[dict]
+    by_profile: dict[str, dict]
+    tokens_saved_per_day: list[dict]
+
+
+# ── Cache ────────────────────────────────────────────────────────────────────
+
+class CacheSetRequest(BaseModel):
+    prompt: str = Field(description="Prompt text (used as cache key)")
+    response: str = Field(description="LLM response to cache")
+    model: str = Field("default", description="Model name for scoping")
+    ttl: Optional[int] = Field(None, description="TTL in seconds (null = no expiry)")
+
+
+class CacheEntry(BaseModel):
+    id: int
+    prompt_hash: str
+    prompt_preview: str
+    model: str
+    response: str
+    hit_count: int
+    ttl: Optional[int]
+    created_at: str
+    last_hit_at: Optional[str]
+    expires_at: Optional[str]
+
+
+class CacheAnalytics(BaseModel):
+    total_entries: int
+    total_hits: int
+    hit_rate: float
+    total_size_bytes: int
+    top_entries: list[dict]
+    by_model: dict[str, dict]
+
+
+# ── Profiles ─────────────────────────────────────────────────────────────────
+
+class ProfileCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: Optional[str] = None
+    remove_filler: bool = True
+    remove_duplicates: bool = True
+    shorten_sentences: bool = False
+    aggressiveness: float = Field(0.5, ge=0.0, le=1.0)
+
+
+class ProfileUpdate(BaseModel):
+    description: Optional[str] = None
+    remove_filler: Optional[bool] = None
+    remove_duplicates: Optional[bool] = None
+    shorten_sentences: Optional[bool] = None
+    aggressiveness: Optional[float] = Field(None, ge=0.0, le=1.0)
+
+
+class ProfileResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    remove_filler: bool
+    remove_duplicates: bool
+    shorten_sentences: bool
+    aggressiveness: float
+    is_builtin: bool
+    times_used: int
+    created_at: str
+
+
+# ── Model Costs ──────────────────────────────────────────────────────────────
+
+class ModelCostCreate(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+    input_cost_per_1k: float = Field(ge=0, description="Cost per 1K input tokens in USD")
+    output_cost_per_1k: float = Field(ge=0, description="Cost per 1K output tokens in USD")
+
+
+class ModelCostUpdate(BaseModel):
+    input_cost_per_1k: Optional[float] = Field(None, ge=0)
+    output_cost_per_1k: Optional[float] = Field(None, ge=0)
+
+
+class ModelCostResponse(BaseModel):
+    id: int
+    model: str
+    input_cost_per_1k: float
+    output_cost_per_1k: float
+    created_at: str
+
+
+# ── Statistics & Daily Log ───────────────────────────────────────────────────
+
+class StatsResponse(BaseModel):
+    total_requests: int
+    total_tokens_in: int
+    total_tokens_out: int
+    total_tokens_saved: int
+    total_cost: float
+    total_savings: float
+    cache_hits: int
+    cache_misses: int
+    cache_hit_rate: float
+    avg_compression_ratio: float
+    top_models: list[dict]
+
+
+class DailyStatsEntry(BaseModel):
+    date: str
+    model: str
+    requests: int
+    tokens_in: int
+    tokens_out: int
+    tokens_saved: int
+    cost: float
+    cache_hits: int
+    cache_misses: int
+
+
+# ── Budget ───────────────────────────────────────────────────────────────────
+
+class BudgetConfig(BaseModel):
+    daily_limit: Optional[float] = Field(None, ge=0, description="Daily cost limit in USD")
+    monthly_limit: Optional[float] = Field(None, ge=0, description="Monthly cost limit in USD")
+
+
+class BudgetStatus(BaseModel):
+    daily_limit: Optional[float]
+    monthly_limit: Optional[float]
+    daily_spent: float
+    monthly_spent: float
+    daily_remaining: Optional[float]
+    monthly_remaining: Optional[float]
+    over_budget: bool
+    daily_pct: Optional[float]
+    monthly_pct: Optional[float]
+
+
+# ── Templates ────────────────────────────────────────────────────────────────
+
+class TemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, description="Template with {{variable}} placeholders")
+    description: Optional[str] = None
+    tags: Optional[list[str]] = None
+
+
+class TemplateUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    content: Optional[str] = Field(None, min_length=1)
+    description: Optional[str] = None
+    tags: Optional[list[str]] = None
+
+
+class TemplateResponse(BaseModel):
+    id: int
+    name: str
+    content: str
+    description: Optional[str]
+    tags: list[str]
+    version: int
+    times_rendered: int
+    created_at: str
+    updated_at: str
+
+
+class TemplateRenderRequest(BaseModel):
+    variables: dict[str, str] = Field(description="Variables to substitute into the template")
+
+
+class TemplateRenderResponse(BaseModel):
+    rendered: str
+    original_tokens: int
+    rendered_tokens: int
+    variables_used: list[str]
+    variables_missing: list[str]
+
+
+class TemplateDiffResponse(BaseModel):
+    template_id: int
+    version_a: int
+    version_b: int
+    diff: list[str]
+
+
+class TemplateVersionResponse(BaseModel):
+    id: int
+    template_id: int
+    version: int
+    content: str
+    created_at: str
+
+
+# ── Cost Estimation ──────────────────────────────────────────────────────────
+
+class CostEstimateRequest(BaseModel):
+    prompt: str
+    max_output_tokens: int = Field(500, ge=1)
+
+
+class CostEstimateEntry(BaseModel):
+    model: str
+    input_tokens: int
+    output_tokens: int
+    input_cost: float
+    output_cost: float
+    total_cost: float
+    compressed_input_tokens: Optional[int]
+    compressed_total_cost: Optional[float]
+    savings: Optional[float]
+
+
+class CostEstimateResponse(BaseModel):
+    estimates: list[CostEstimateEntry]
+    cheapest: str
+    most_expensive: str
+
+
+# ── Benchmarking ─────────────────────────────────────────────────────────────
+
+class BenchmarkRequest(BaseModel):
+    prompt: str
+
+
+class BenchmarkEntry(BaseModel):
+    profile: str
+    original_tokens: int
+    compressed_tokens: int
+    ratio: float
+    rules_applied: int
+    estimated_cost: Optional[float]
+
+
+class BenchmarkResponse(BaseModel):
+    results: list[BenchmarkEntry]
+    best_profile: str
+    best_ratio: float
 
 
 # ── Model Comparison ─────────────────────────────────────────────────────────
 
-class ModelCompareRequest(BaseModel):
-    prompt: str = Field(..., description="Prompt to compare costs across models")
-    compress: bool = Field(False, description="Also compare compressed cost")
-    profile: Optional[str] = Field(None, description="Compression profile if compress=True")
+class ModelComparisonRequest(BaseModel):
+    prompt: str
+    max_output_tokens: int = Field(500, ge=1)
+    profile: Optional[str] = Field(None, description="Profile for compression estimate")
 
 
-class ModelCompareItem(BaseModel):
+class ModelComparisonEntry(BaseModel):
     model: str
-    input_tokens: int
-    input_cost_usd: float
-    compressed_tokens: Optional[int] = None
-    compressed_cost_usd: Optional[float] = None
-    savings_usd: Optional[float] = None
-    savings_pct: Optional[float] = None
+    input_cost: float
+    output_cost: float
+    total_cost: float
+    with_compression: Optional[float]
+    savings_pct: Optional[float]
 
 
-class ModelCompareResponse(BaseModel):
+class ModelComparisonResponse(BaseModel):
+    entries: list[ModelComparisonEntry]
+    recommended: str
+    recommendation_reason: str
+
+
+# ── Batch Processing ─────────────────────────────────────────────────────────
+
+class BatchPrompt(BaseModel):
+    prompt: str
+    model: str = "default"
+
+
+class BatchRequest(BaseModel):
+    prompts: list[BatchPrompt] = Field(min_length=1)
+    profile: str = "balanced"
+    use_cache: bool = True
+
+
+class BatchResultEntry(BaseModel):
+    index: int
+    prompt_preview: str
     original_tokens: int
-    compressed_tokens: Optional[int]
-    models_compared: int
-    results: list[ModelCompareItem]
-    cheapest_model: Optional[str]
-    best_savings_model: Optional[str]
+    compressed_tokens: int
+    ratio: float
+    cache_hit: bool
+    deduplicated: bool
+    mock_response: Optional[str]
 
 
-# ── Compression Rules (v0.8.0) ───────────────────────────────────────────────
-
-class CompressionRuleCreate(BaseModel):
-    pattern: str = Field(..., min_length=1, max_length=500, description="Regex pattern to match")
-    replacement: str = Field("", max_length=500, description="Replacement string (empty = remove)")
-    priority: int = Field(50, ge=0, le=100, description="Execution order: lower = earlier (0-100)")
-    description: Optional[str] = Field(None, max_length=300)
-
-
-class CompressionRuleUpdate(BaseModel):
-    pattern: Optional[str] = Field(None, min_length=1, max_length=500)
-    replacement: Optional[str] = Field(None, max_length=500)
-    priority: Optional[int] = Field(None, ge=0, le=100)
-    description: Optional[str] = Field(None, max_length=300)
+class BatchResponse(BaseModel):
+    total: int
+    deduplicated: int
+    cache_hits: int
+    results: list[BatchResultEntry]
+    total_tokens_saved: int
+    total_estimated_cost: float
 
 
-class CompressionRuleResponse(BaseModel):
+# ── Compression Rules ────────────────────────────────────────────────────────
+
+class RuleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    pattern: str = Field(description="Regex pattern to match")
+    replacement: str = Field(description="Replacement string")
+    priority: int = Field(0, description="Higher = applied first")
+    enabled: bool = True
+    description: Optional[str] = None
+
+
+class RuleUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    pattern: Optional[str] = None
+    replacement: Optional[str] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class RuleResponse(BaseModel):
     id: int
+    name: str
     pattern: str
     replacement: str
     priority: int
+    enabled: bool
     description: Optional[str]
     times_applied: int
     created_at: str
 
 
-# ── Prompt Diff (v0.8.0) ─────────────────────────────────────────────────────
+# ── Prompt Diff ──────────────────────────────────────────────────────────────
 
 class PromptDiffRequest(BaseModel):
-    prompt_a: str = Field(..., min_length=1, description="First prompt")
-    prompt_b: str = Field(..., min_length=1, description="Second prompt")
-    compress: bool = Field(False, description="Also compare compressed versions")
-    profile: Optional[str] = Field(None, description="Compression profile if compress=True")
+    prompt_a: str
+    prompt_b: str
 
 
 class PromptDiffResponse(BaseModel):
     tokens_a: int
     tokens_b: int
-    diff_tokens: int
-    diff_pct: float
-    cheaper: str = Field(..., description="a | b | equal")
-    char_diff: int
-    compressed_tokens_a: Optional[int] = None
-    compressed_tokens_b: Optional[int] = None
-    compressed_cheaper: Optional[str] = None
-    cost_comparison: Optional[list[dict]] = None
+    token_diff: int
+    diff_lines: list[str]
+    similarity: float
 
 
-# ── Usage Quotas (v0.8.0) ────────────────────────────────────────────────────
+# ── Usage Quotas ─────────────────────────────────────────────────────────────
 
-class UsageQuotaSet(BaseModel):
-    daily_token_limit: Optional[int] = Field(None, ge=0, description="Daily token limit for this model")
-    monthly_token_limit: Optional[int] = Field(None, ge=0, description="Monthly token limit for this model")
-
-
-class UsageQuotaResponse(BaseModel):
+class QuotaCreate(BaseModel):
     model: str
-    daily_token_limit: Optional[int]
-    monthly_token_limit: Optional[int]
+    daily_limit: Optional[int] = Field(None, ge=0, description="Max tokens per day")
+    monthly_limit: Optional[int] = Field(None, ge=0, description="Max tokens per month")
+
+
+class QuotaUpdate(BaseModel):
+    daily_limit: Optional[int] = Field(None, ge=0)
+    monthly_limit: Optional[int] = Field(None, ge=0)
+
+
+class QuotaResponse(BaseModel):
+    id: int
+    model: str
+    daily_limit: Optional[int]
+    monthly_limit: Optional[int]
     daily_used: int
     monthly_used: int
-    daily_pct: float
-    monthly_pct: float
     daily_remaining: Optional[int]
     monthly_remaining: Optional[int]
     over_quota: bool
     created_at: str
 
 
-# ── Prompt Versioning (v0.9.0) ───────────────────────────────────────────────
-
-class TemplateVersionResponse(BaseModel):
-    id: int
-    template_id: int
-    version_number: int
-    template_text: str
-    variables: list[str]
-    change_description: Optional[str]
-    tokens_count: int
-    created_at: str
-
-
-class TemplateVersionDiff(BaseModel):
-    version_a: int
-    version_b: int
-    text_a_preview: str
-    text_b_preview: str
-    tokens_a: int
-    tokens_b: int
-    token_diff: int
-    token_change_pct: float
-
-
-class TemplateRollbackRequest(BaseModel):
-    version_number: int = Field(..., ge=1, description="Version number to rollback to")
-
-
-# ── Cost Alerts (v0.9.0) ────────────────────────────────────────────────────
+# ── Cost Alerts ──────────────────────────────────────────────────────────────
 
 class AlertRuleCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100, description="Alert rule name (must be unique)")
-    condition_type: str = Field(..., description="One of: spend_exceeds, hit_rate_below, tokens_exceed, compression_ratio_below")
-    threshold: float = Field(..., description="Threshold value for the condition")
-    period: str = Field("daily", description="Period: daily, weekly, or monthly")
-    is_enabled: bool = Field(True, description="Whether this rule is active")
+    name: str = Field(min_length=1, max_length=200)
+    metric: str = Field(description="Metric: daily_cost, monthly_cost, tokens_used, cache_miss_rate")
+    operator: str = Field(description="Operator: gt, gte, lt, lte, eq")
+    threshold: float
+    model: Optional[str] = None
+    enabled: bool = True
 
 
 class AlertRuleUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    metric: Optional[str] = None
+    operator: Optional[str] = None
     threshold: Optional[float] = None
-    period: Optional[str] = None
-    is_enabled: Optional[bool] = None
+    model: Optional[str] = None
+    enabled: Optional[bool] = None
 
 
 class AlertRuleResponse(BaseModel):
     id: int
     name: str
-    condition_type: str
+    metric: str
+    operator: str
     threshold: float
-    period: str
-    is_enabled: bool
+    model: Optional[str]
+    enabled: bool
     times_triggered: int
     last_triggered_at: Optional[str]
     created_at: str
@@ -467,65 +442,178 @@ class AlertLogEntry(BaseModel):
     id: int
     rule_id: int
     rule_name: str
-    condition_type: str
+    metric: str
+    current_value: float
     threshold: float
-    actual_value: float
     message: str
-    is_acknowledged: bool
-    triggered_at: str
-    acknowledged_at: Optional[str]
+    acknowledged: bool
+    created_at: str
 
 
 class AlertSummary(BaseModel):
     total_rules: int
-    active_rules: int
-    total_alerts: int
+    enabled_rules: int
+    total_alerts_today: int
+    total_alerts_week: int
     unacknowledged: int
     recent_alerts: list[AlertLogEntry]
 
 
-# ── Compression A/B Testing (v0.9.0) ────────────────────────────────────────
+# ── A/B Testing ──────────────────────────────────────────────────────────────
 
-class ABExperimentCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100, description="Experiment name")
-    profile_a: str = Field(..., description="First compression profile name")
-    profile_b: str = Field(..., description="Second compression profile name")
+class ExperimentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: Optional[str] = None
+    profile_a: str = Field(description="First compression profile")
+    profile_b: str = Field(description="Second compression profile")
+    sample_size: int = Field(100, ge=2, description="Number of prompts to test")
 
 
-class ABExperimentResponse(BaseModel):
+class ExperimentResponse(BaseModel):
     id: int
     name: str
+    description: Optional[str]
     profile_a: str
     profile_b: str
-    status: str
-    tests_count: int
-    profile_a_wins: int
-    profile_b_wins: int
-    ties: int
-    win_rate_a: float
-    win_rate_b: float
+    sample_size: int
+    runs_completed: int
+    status: str  # pending, running, completed
     created_at: str
     completed_at: Optional[str]
 
 
-class ABTestPromptRequest(BaseModel):
-    prompt: str = Field(..., min_length=1, description="Prompt text to test with both profiles")
+class ExperimentRunRequest(BaseModel):
+    prompt: str
 
 
-class ABTestResultResponse(BaseModel):
-    id: int
+class ExperimentRunResponse(BaseModel):
     experiment_id: int
-    prompt_preview: str
-    profile_a_tokens: int
-    profile_b_tokens: int
-    profile_a_ratio: float
-    profile_b_ratio: float
-    winner: str
-    tested_at: str
+    run_number: int
+    variant: str  # A or B
+    profile: str
+    original_tokens: int
+    compressed_tokens: int
+    ratio: float
+    rules_applied: int
 
 
-class ABExperimentSummary(BaseModel):
-    total_experiments: int
-    running: int
-    completed: int
-    total_tests: int
+class ExperimentResults(BaseModel):
+    experiment_id: int
+    name: str
+    status: str
+    profile_a: str
+    profile_b: str
+    runs_a: int
+    runs_b: int
+    avg_ratio_a: float
+    avg_ratio_b: float
+    avg_tokens_saved_a: float
+    avg_tokens_saved_b: float
+    winner: Optional[str]
+    confidence: Optional[float]
+    detail: list[dict]
+
+
+# ── Prompt Playground (NEW v1.0.0) ───────────────────────────────────────────
+
+class PlaygroundSessionCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: Optional[str] = None
+
+
+class PlaygroundSessionUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = None
+
+
+class PlaygroundSessionResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    runs_count: int
+    created_at: str
+    updated_at: str
+
+
+class PlaygroundRunRequest(BaseModel):
+    prompt: str
+    profile: Optional[str] = "balanced"
+    model: Optional[str] = None
+    compress: bool = True
+    cache_lookup: bool = True
+
+
+class PlaygroundRunResponse(BaseModel):
+    id: int
+    session_id: int
+    original_tokens: int
+    compressed_tokens: int
+    compression_ratio: float
+    estimated_cost: Optional[float]
+    cache_hit: bool
+    profile_used: str
+    rules_applied: int
+    compressed_text: str
+    created_at: str
+
+
+# ── Cost Forecasting (NEW v1.0.0) ───────────────────────────────────────────
+
+class CostForecastResponse(BaseModel):
+    current_daily_avg: float
+    current_weekly_total: float
+    forecast_7d: float
+    forecast_30d: float
+    burn_rate_tokens_per_day: float
+    burn_rate_cost_per_day: float
+    budget_exhaustion_date: Optional[str]
+    trend: str  # increasing, stable, decreasing
+    trend_pct_change: float
+    recommendations: list[str]
+
+
+class CostBreakdownEntry(BaseModel):
+    model: str
+    total_tokens: int
+    total_cost: float
+    pct_of_total: float
+    avg_daily_tokens: float
+    trend: str  # increasing, stable, decreasing
+
+
+# ── Compression Chains (NEW v1.0.0) ─────────────────────────────────────────
+
+class ChainCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: Optional[str] = None
+    steps: list[str] = Field(min_length=2, description="Profile names in order, min 2")
+
+
+class ChainUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = None
+    steps: Optional[list[str]] = Field(None, min_length=2)
+
+
+class ChainResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    steps: list[str]
+    times_used: int
+    avg_final_ratio: Optional[float]
+    created_at: str
+
+
+class ChainRunRequest(BaseModel):
+    prompt: str
+
+
+class ChainRunResponse(BaseModel):
+    chain_id: int
+    chain_name: str
+    original_tokens: int
+    final_tokens: int
+    final_ratio: float
+    step_results: list[dict]
+    total_rules_applied: int
