@@ -1,70 +1,41 @@
 # TokenSaver — Architecture (DEEP.md)
 
 ## Overview
-LLM API cost optimizer providing prompt compression, semantic caching, batch deduplication, and cost tracking with model-aware pricing.
+LLM API cost optimizer: prompt compression, semantic caching, batch dedup, model cost profiles, cost estimation, compression benchmarks, budget tracking.
 
-## Data Model
+## Stack
+- FastAPI + aiosqlite + Pydantic v2
+- SQLite with auto-migration on startup
 
-### Core Tables
-- **cache** — SHA-256 keyed prompt/response store with hit tracking
-- **stats** — singleton row for aggregate metrics
-- **daily_log** — per-day per-model usage breakdown (UNIQUE day+model)
-- **model_costs** — per-model pricing (input/output cost per 1M tokens)
-- **profiles** — compression presets (3 built-in + custom)
+## Modules
+- **main.py** — FastAPI app, all route handlers (29 endpoints)
+- **cache.py** — DB init, cache ops, stats, model costs, profiles, analytics, cost estimation, benchmarks, budgets
+- **compressor.py** — Prompt compression logic (ratio-based, code preservation, example/comment stripping)
+- **models.py** — Pydantic v2 request/response schemas
 
-### Relationships
-```
-profiles ──(by name)──> compress endpoint
-model_costs ──(by name)──> daily_log cost calculation
-cache ──(by model)──> model_costs (pricing lookup)
-```
+## Key Features (v0.6.0)
+1. Prompt compression with configurable profiles
+2. Semantic caching with hash-based lookup
+3. Batch processing with deduplication
+4. Model cost profiles (CRUD)
+5. Compression profiles (CRUD, built-in defaults)
+6. Cache analytics (top entries, model breakdown)
+7. Daily stats with CSV export
+8. **Cost estimation** across all registered models
+9. **Compression benchmark** — test all profiles on a prompt
+10. **Budget tracking** — daily/monthly token limits with alerts
 
-## Compression Pipeline
-1. Extract and preserve code blocks (regex ```` ``` ```` matching)
-2. Optionally strip examples (profile setting)
-3. Optionally strip code comments (profile setting)
-4. Normalize whitespace
-5. Remove filler phrases (12 patterns)
-6. Middle truncation if above target ratio (60% start / 40% end)
-7. Restore code blocks
+## Database Tables
+- cache, stats, model_costs, compression_profiles, daily_stats, budgets
 
-## Built-in Profiles
-| Name | max_ratio | preserve_code | strip_examples | strip_comments |
-|------|-----------|---------------|----------------|----------------|
-| aggressive | 0.3 | yes | yes | yes |
-| balanced | 0.5 | yes | no | no |
-| minimal | 0.8 | yes | no | no |
-
-## Cache Strategy
-- Key: SHA-256 of `{model}:{prompt}`
-- Exact match only (no fuzzy/similarity)
-- LRU-style purge by `last_hit` timestamp
-- Per-model filtering on purge
-
-## Cost Calculation
-- Each model has `input_cost_per_1m` and `output_cost_per_1m`
-- Savings = tokens_saved * cost_per_1m / 1,000,000
-- Fallback: $0.15/1M tokens if model not registered
-
-## API Surface (v0.5.0)
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | /compress | Compress prompt (optional profile) |
-| POST/GET/PATCH/DELETE | /profiles/* | Compression profiles CRUD |
-| POST/GET/PATCH/DELETE | /models/* | Model cost profiles CRUD |
-| GET/POST/DELETE | /cache/* | Cache operations |
-| GET | /cache/analytics | Hit rate, top entries, model breakdown |
-| POST | /cache/lookup | Check cache for prompt |
-| POST | /cache/store | Store prompt/response |
-| POST | /cache/purge | Purge old entries |
-| POST | /batch | Batch process with dedup |
-| GET | /stats | Aggregate usage stats |
-| GET | /stats/daily | Daily breakdown (JSON) |
-| GET | /stats/daily/csv | Daily breakdown (CSV download) |
-| GET | /health | Health check |
-
-## Key Decisions
-- **SQLite + WAL**: single-file DB, good enough for moderate load
-- **No fuzzy cache**: exact hash match avoids false positives; similarity search deferred to future version with embeddings
-- **Built-in profiles immutable**: prevents accidental modification of defaults; users create custom profiles instead
-- **CSV export via PlainTextResponse**: lightweight, no extra dependencies
+## API Endpoints (29 total)
+- Health: GET /health
+- Compression: POST /compress
+- Cost Estimation: POST /estimate
+- Benchmark: POST /benchmark
+- Budget: PUT /budget, GET /budget
+- Profiles: CRUD /profiles
+- Models: CRUD /models
+- Cache: GET/POST/DELETE /cache, /cache/lookup, /cache/store, /cache/purge, /cache/analytics
+- Batch: POST /batch
+- Stats: GET /stats, GET /stats/daily, GET /stats/daily/csv
