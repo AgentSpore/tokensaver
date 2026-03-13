@@ -21,6 +21,9 @@ from models import (
     PromptTemplateRenderRequest, PromptTemplateRenderResponse,
     CompressionHistoryEntry, CompressionAnalytics,
     ModelCompareRequest, ModelCompareResponse,
+    CompressionRuleCreate, CompressionRuleUpdate, CompressionRuleResponse,
+    PromptDiffRequest, PromptDiffResponse,
+    UsageQuotaSet, UsageQuotaResponse,
 )
 from compressor import compress_prompt, estimate_tokens
 from cache import (
@@ -35,6 +38,11 @@ from cache import (
     update_prompt_template, delete_prompt_template, render_prompt_template,
     list_compression_history, get_compression_analytics,
     compare_models,
+    create_compression_rule, list_compression_rules, get_compression_rule,
+    update_compression_rule, delete_compression_rule,
+    get_active_rules, increment_rule_applied,
+    prompt_diff,
+    set_usage_quota, get_usage_quota, list_usage_quotas, delete_usage_quota,
 )
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
@@ -53,9 +61,10 @@ app = FastAPI(
         "LLM API cost optimizer: prompt compression, semantic caching, batch dedup, "
         "model cost profiles, cost estimation, compression benchmarks, budget tracking, "
         "prompt templates with variable substitution, compression history analytics, "
-        "and cross-model cost comparison."
+        "cross-model cost comparison, custom compression rules, prompt diff analysis, "
+        "and per-model usage quotas."
     ),
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -63,7 +72,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.7.0"}
+    return {"status": "ok", "version": "0.8.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
@@ -84,13 +93,25 @@ async def compress(req: CompressRequest):
         strip_comments = p["strip_comments"]
         profile_used = req.profile
 
+    # Fetch custom rules if enabled
+    custom_rules = None
+    if req.apply_rules:
+        custom_rules = await get_active_rules(app.state.db)
+
     original_tokens = estimate_tokens(req.prompt)
-    compressed = compress_prompt(
+    compressed, rules_applied = compress_prompt(
         req.prompt, max_ratio, preserve_code,
         strip_examples=strip_examples, strip_comments=strip_comments,
+        custom_rules=custom_rules if custom_rules else None,
     )
     compressed_tokens = estimate_tokens(compressed)
     savings_pct = round((1 - compressed_tokens / max(original_tokens, 1)) * 100, 1)
+
+    # Track which rules were applied
+    if rules_applied > 0 and custom_rules:
+        applied_ids = [r["id"] for r in custom_rules[:rules_applied]]
+        await increment_rule_applied(app.state.db, applied_ids)
+
     await record_compression(
         app.state.db, original_tokens, compressed_tokens,
         profile=profile_used, prompt_preview=req.prompt[:120],
@@ -103,7 +124,90 @@ async def compress(req: CompressRequest):
         savings_pct=savings_pct,
         compression_ratio=round(compressed_tokens / max(original_tokens, 1), 3),
         profile_used=profile_used,
+        rules_applied=rules_applied,
     )
+
+
+# ── Compression Rules (v0.8.0) ───────────────────────────────────────────────
+
+@app.post("/rules", response_model=CompressionRuleResponse, status_code=201)
+async def add_rule(body: CompressionRuleCreate):
+    """Create a custom regex-based compression rule. Applied during prompt compression."""
+    try:
+        return await create_compression_rule(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/rules", response_model=list[CompressionRuleResponse])
+async def get_rules():
+    """List all compression rules, ordered by priority (lower = applied first)."""
+    return await list_compression_rules(app.state.db)
+
+
+@app.get("/rules/{rule_id}", response_model=CompressionRuleResponse)
+async def get_rule_detail(rule_id: int):
+    rule = await get_compression_rule(app.state.db, rule_id)
+    if not rule:
+        raise HTTPException(404, "Rule not found")
+    return rule
+
+
+@app.patch("/rules/{rule_id}", response_model=CompressionRuleResponse)
+async def patch_rule(rule_id: int, body: CompressionRuleUpdate):
+    try:
+        result = await update_compression_rule(app.state.db, rule_id, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if not result:
+        raise HTTPException(404, "Rule not found")
+    return result
+
+
+@app.delete("/rules/{rule_id}", status_code=204)
+async def remove_rule(rule_id: int):
+    ok = await delete_compression_rule(app.state.db, rule_id)
+    if not ok:
+        raise HTTPException(404, "Rule not found")
+
+
+# ── Prompt Diff (v0.8.0) ─────────────────────────────────────────────────────
+
+@app.post("/diff", response_model=PromptDiffResponse)
+async def diff_prompts(body: PromptDiffRequest):
+    """Compare two prompts: token counts, character lengths, and optional compressed cost analysis."""
+    return await prompt_diff(app.state.db, body.prompt_a, body.prompt_b,
+                             body.compress, body.profile)
+
+
+# ── Usage Quotas (v0.8.0) ────────────────────────────────────────────────────
+
+@app.put("/quotas/{model}", response_model=UsageQuotaResponse)
+async def update_quota(model: str, body: UsageQuotaSet):
+    """Set or update daily/monthly token quota for a specific model."""
+    return await set_usage_quota(app.state.db, model,
+                                 body.daily_token_limit, body.monthly_token_limit)
+
+
+@app.get("/quotas", response_model=list[UsageQuotaResponse])
+async def get_quotas():
+    """List all per-model usage quotas with current usage stats."""
+    return await list_usage_quotas(app.state.db)
+
+
+@app.get("/quotas/{model}", response_model=UsageQuotaResponse)
+async def get_quota_detail(model: str):
+    quota = await get_usage_quota(app.state.db, model)
+    if not quota:
+        raise HTTPException(404, f"No quota set for model '{model}'")
+    return quota
+
+
+@app.delete("/quotas/{model}", status_code=204)
+async def remove_quota(model: str):
+    ok = await delete_usage_quota(app.state.db, model)
+    if not ok:
+        raise HTTPException(404, f"No quota set for model '{model}'")
 
 
 # ── Cost Estimation ────────────────────────────────────────────────────────
