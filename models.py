@@ -89,6 +89,8 @@ class UsageStats(BaseModel):
     avg_compression_ratio: float
     estimated_cost_saved_usd: float
     registered_models: int
+    total_templates: int
+    compression_history_entries: int
 
 
 class CachePurgeRequest(BaseModel):
@@ -235,3 +237,93 @@ class BudgetStatusResponse(BaseModel):
     monthly_pct: float
     over_budget: bool
     alerts: list[str]
+
+
+# ── Prompt Templates ─────────────────────────────────────────────────────────
+
+class PromptTemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Template name")
+    template_text: str = Field(..., min_length=1, description="Template with {{variable}} placeholders")
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class PromptTemplateUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    template_text: Optional[str] = Field(None, min_length=1)
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class PromptTemplateResponse(BaseModel):
+    id: int
+    name: str
+    template_text: str
+    variables: list[str]
+    description: Optional[str]
+    times_used: int
+    created_at: str
+
+
+class PromptTemplateRenderRequest(BaseModel):
+    variables: dict[str, str] = Field(..., description="Variable values to substitute, e.g. {'language': 'Python'}")
+    compress: bool = Field(False, description="Compress the rendered prompt")
+    profile: Optional[str] = Field(None, description="Compression profile to use if compress=True")
+
+
+class PromptTemplateRenderResponse(BaseModel):
+    rendered: str
+    rendered_tokens: int
+    compressed: Optional[str] = None
+    compressed_tokens: Optional[int] = None
+    savings_pct: Optional[float] = None
+    missing_variables: list[str]
+
+
+# ── Compression History ──────────────────────────────────────────────────────
+
+class CompressionHistoryEntry(BaseModel):
+    id: int
+    prompt_preview: str
+    profile_used: Optional[str]
+    original_tokens: int
+    compressed_tokens: int
+    compression_ratio: float
+    savings_pct: float
+    model: Optional[str]
+    created_at: str
+
+
+class CompressionAnalytics(BaseModel):
+    total_compressions: int
+    avg_ratio: float
+    avg_savings_pct: float
+    best_ratio: float
+    worst_ratio: float
+    by_profile: list[dict]
+    daily_trend: list[dict]
+
+
+# ── Model Comparison ─────────────────────────────────────────────────────────
+
+class ModelCompareRequest(BaseModel):
+    prompt: str = Field(..., description="Prompt to compare costs across models")
+    compress: bool = Field(False, description="Also compare compressed cost")
+    profile: Optional[str] = Field(None, description="Compression profile if compress=True")
+
+
+class ModelCompareItem(BaseModel):
+    model: str
+    input_tokens: int
+    input_cost_usd: float
+    compressed_tokens: Optional[int] = None
+    compressed_cost_usd: Optional[float] = None
+    savings_usd: Optional[float] = None
+    savings_pct: Optional[float] = None
+
+
+class ModelCompareResponse(BaseModel):
+    original_tokens: int
+    compressed_tokens: Optional[int]
+    models_compared: int
+    results: list[ModelCompareItem]
+    cheapest_model: Optional[str]
+    best_savings_model: Optional[str]
