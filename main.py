@@ -14,6 +14,9 @@ from models import (
     ModelCostCreate, ModelCostUpdate, ModelCostResponse,
     ProfileCreate, ProfileUpdate, ProfileResponse,
     CacheAnalyticsResponse,
+    CostEstimateRequest, CostEstimateResponse,
+    BenchmarkRequest, BenchmarkResponse,
+    BudgetSetRequest, BudgetStatusResponse,
 )
 from compressor import compress_prompt, estimate_tokens
 from cache import (
@@ -23,6 +26,7 @@ from cache import (
     create_model_cost, list_model_costs, get_model_cost, update_model_cost, delete_model_cost,
     create_profile, list_profiles, get_profile, update_profile, delete_profile,
     get_cache_analytics, export_daily_csv,
+    estimate_cost, benchmark_profiles, set_budget, get_budget_status,
 )
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
@@ -37,8 +41,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TokenSaver",
-    description="LLM API cost optimizer: prompt compression with profiles, semantic caching, batch deduplication, model cost profiles, cache analytics.",
-    version="0.5.0",
+    description="LLM API cost optimizer: prompt compression, semantic caching, batch dedup, model cost profiles, cost estimation, compression benchmarks, budget tracking.",
+    version="0.6.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -46,7 +50,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
@@ -84,6 +88,55 @@ async def compress(req: CompressRequest):
         compression_ratio=round(compressed_tokens / max(original_tokens, 1), 3),
         profile_used=profile_used,
     )
+
+
+# ── Cost Estimation ────────────────────────────────────────────────────────
+
+@app.post("/estimate", response_model=CostEstimateResponse)
+async def cost_estimate(body: CostEstimateRequest):
+    """Estimate cost for a prompt across all registered models."""
+    token_count = estimate_tokens(body.prompt)
+    estimates = await estimate_cost(app.state.db, token_count, body.model)
+    cheapest = min(estimates, key=lambda x: x["total_estimate_usd"])["model"] if estimates else None
+    return CostEstimateResponse(
+        input_tokens=token_count,
+        estimates=estimates,
+        cheapest_model=cheapest,
+    )
+
+
+# ── Compression Benchmark ──────────────────────────────────────────────────
+
+@app.post("/benchmark", response_model=BenchmarkResponse)
+async def benchmark(body: BenchmarkRequest):
+    """Compress a prompt with all profiles and compare results side by side."""
+    results = await benchmark_profiles(app.state.db, body.prompt)
+    original_tokens = results[0]["original_tokens"] if results else estimate_tokens(body.prompt)
+    best = results[0] if results else None
+    return BenchmarkResponse(
+        original_tokens=original_tokens,
+        profiles_tested=len(results),
+        results=results,
+        best_profile=best["profile"] if best else "balanced",
+        best_savings_pct=best["savings_pct"] if best else 0.0,
+    )
+
+
+# ── Budget Tracking ────────────────────────────────────────────────────────
+
+@app.put("/budget", response_model=BudgetStatusResponse)
+async def update_budget(body: BudgetSetRequest):
+    """Set or update daily/monthly token budget limits."""
+    return await set_budget(
+        app.state.db, body.daily_token_limit, body.monthly_token_limit,
+        body.alert_threshold_pct,
+    )
+
+
+@app.get("/budget", response_model=BudgetStatusResponse)
+async def budget_status():
+    """Get current budget status: usage vs limits, alerts."""
+    return await get_budget_status(app.state.db)
 
 
 # ── Compression Profiles ────────────────────────────────────────────────────
