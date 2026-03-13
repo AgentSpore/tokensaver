@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import re
 from datetime import datetime, timezone
 import aiosqlite
 
@@ -84,12 +85,13 @@ async def init_db(path: str) -> aiosqlite.Connection:
             p,
         )
     await _migrate_budgets(db)
+    await _migrate_prompt_templates(db)
+    await _migrate_compression_history(db)
     await db.commit()
     return db
 
 
 async def _migrate_budgets(db: aiosqlite.Connection):
-    """Create budgets table if it doesn't exist."""
     await db.execute("""
         CREATE TABLE IF NOT EXISTS budgets (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -99,6 +101,38 @@ async def _migrate_budgets(db: aiosqlite.Connection):
             updated_at TEXT NOT NULL
         )
     """)
+
+
+async def _migrate_prompt_templates(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS prompt_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            template_text TEXT NOT NULL,
+            variables TEXT NOT NULL DEFAULT '[]',
+            description TEXT,
+            times_used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+
+async def _migrate_compression_history(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS compression_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt_preview TEXT,
+            profile_used TEXT,
+            original_tokens INTEGER NOT NULL,
+            compressed_tokens INTEGER NOT NULL,
+            compression_ratio REAL NOT NULL,
+            savings_pct REAL NOT NULL,
+            model TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_comp_hist_profile ON compression_history(profile_used)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_comp_hist_date ON compression_history(created_at)")
 
 
 def _hash(prompt: str, model: str = "") -> str:
@@ -334,6 +368,10 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     cache_count = cache_rows[0]["cnt"] if cache_rows else 0
     model_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM model_costs")
     model_count = model_rows[0]["cnt"] if model_rows else 0
+    tpl_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM prompt_templates")
+    tpl_count = tpl_rows[0]["cnt"] if tpl_rows else 0
+    hist_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM compression_history")
+    hist_count = hist_rows[0]["cnt"] if hist_rows else 0
     avg_ratio = (
         round(s["sum_compression_ratio"] / s["compression_requests"], 3)
         if s["compression_requests"] > 0 else 1.0
@@ -349,6 +387,8 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "avg_compression_ratio": avg_ratio,
         "estimated_cost_saved_usd": estimated_saved,
         "registered_models": model_count,
+        "total_templates": tpl_count,
+        "compression_history_entries": hist_count,
     }
 
 
@@ -367,9 +407,12 @@ async def _calculate_total_cost_saved(db: aiosqlite.Connection, total_tokens: in
     return round(total_cost, 6)
 
 
-async def record_compression(db: aiosqlite.Connection, original_tokens: int, compressed_tokens: int):
+async def record_compression(db: aiosqlite.Connection, original_tokens: int,
+                              compressed_tokens: int, profile: str | None = None,
+                              prompt_preview: str | None = None, model: str | None = None):
     ratio = compressed_tokens / max(original_tokens, 1)
     saved = original_tokens - compressed_tokens
+    savings_pct = round((1 - ratio) * 100, 1)
     await db.execute(
         """UPDATE stats SET
            compression_requests = compression_requests + 1,
@@ -379,7 +422,16 @@ async def record_compression(db: aiosqlite.Connection, original_tokens: int, com
            WHERE id = 1""",
         (saved, ratio),
     )
-    await _bump_daily(db, "", compressions=1, tokens_saved=saved)
+    await _bump_daily(db, model or "", compressions=1, tokens_saved=saved)
+
+    # Record in compression history
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        """INSERT INTO compression_history
+           (prompt_preview, profile_used, original_tokens, compressed_tokens, compression_ratio, savings_pct, model, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (prompt_preview or "", profile, original_tokens, compressed_tokens, round(ratio, 3), savings_pct, model, now),
+    )
     await db.commit()
 
 
@@ -508,13 +560,11 @@ async def export_daily_csv(db: aiosqlite.Connection, days: int = 90, model: str 
 
 async def estimate_cost(db: aiosqlite.Connection, token_count: int,
                         model: str | None = None) -> list[dict]:
-    """Estimate cost for a given token count across all registered models or a specific one."""
     if model:
         rows = await db.execute_fetchall("SELECT * FROM model_costs WHERE name = ?", (model,))
     else:
         rows = await db.execute_fetchall("SELECT * FROM model_costs ORDER BY input_cost_per_1m ASC")
     if not rows:
-        # Return default estimate
         default_cost = round(token_count * DEFAULT_COST_PER_1M / 1_000_000, 6)
         return [{
             "model": "(default)",
@@ -540,7 +590,6 @@ async def estimate_cost(db: aiosqlite.Connection, token_count: int,
 # ── Compression Benchmark ────────────────────────────────────────────────────
 
 async def benchmark_profiles(db: aiosqlite.Connection, prompt: str) -> list[dict]:
-    """Compress the same prompt with all profiles and compare results."""
     from compressor import compress_prompt, estimate_tokens
 
     profiles = await list_profiles(db)
@@ -572,7 +621,6 @@ async def benchmark_profiles(db: aiosqlite.Connection, prompt: str) -> list[dict
 
 async def set_budget(db: aiosqlite.Connection, daily_limit: int | None,
                      monthly_limit: int | None, alert_threshold: float = 80.0) -> dict:
-    """Set or update token budget limits."""
     now = datetime.now(timezone.utc).isoformat()
     await db.execute(
         """INSERT INTO budgets (id, daily_token_limit, monthly_token_limit, alert_threshold_pct, updated_at)
@@ -589,7 +637,6 @@ async def set_budget(db: aiosqlite.Connection, daily_limit: int | None,
 
 
 async def get_budget_status(db: aiosqlite.Connection) -> dict:
-    """Get current budget status with usage vs limits."""
     budget_rows = await db.execute_fetchall("SELECT * FROM budgets WHERE id = 1")
     daily_limit = None
     monthly_limit = None
@@ -600,14 +647,12 @@ async def get_budget_status(db: aiosqlite.Connection) -> dict:
         monthly_limit = b["monthly_token_limit"]
         alert_threshold = b["alert_threshold_pct"]
 
-    # Today's usage
     today = _today()
     daily_rows = await db.execute_fetchall(
         "SELECT COALESCE(SUM(tokens_used), 0) as used FROM daily_log WHERE day = ?", (today,)
     )
     daily_used = daily_rows[0]["used"] if daily_rows else 0
 
-    # This month's usage
     month_prefix = _this_month()
     monthly_rows = await db.execute_fetchall(
         "SELECT COALESCE(SUM(tokens_used), 0) as used FROM daily_log WHERE day LIKE ?",
@@ -615,7 +660,6 @@ async def get_budget_status(db: aiosqlite.Connection) -> dict:
     )
     monthly_used = monthly_rows[0]["used"] if monthly_rows else 0
 
-    # Calculate percentages and alerts
     daily_pct = round(daily_used / daily_limit * 100, 1) if daily_limit else 0.0
     monthly_pct = round(monthly_used / monthly_limit * 100, 1) if monthly_limit else 0.0
     daily_remaining = (daily_limit - daily_used) if daily_limit else None
@@ -644,4 +688,289 @@ async def get_budget_status(db: aiosqlite.Connection) -> dict:
         "over_budget": (daily_limit is not None and daily_used >= daily_limit) or
                        (monthly_limit is not None and monthly_used >= monthly_limit),
         "alerts": alerts,
+    }
+
+
+# ── Prompt Templates ─────────────────────────────────────────────────────────
+
+def _extract_variables(template_text: str) -> list[str]:
+    return sorted(set(re.findall(r"\{\{(\w+)\}\}", template_text)))
+
+
+async def create_prompt_template(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    variables = _extract_variables(data["template_text"])
+    import json
+    try:
+        cur = await db.execute(
+            "INSERT INTO prompt_templates (name, template_text, variables, description, created_at) VALUES (?, ?, ?, ?, ?)",
+            (data["name"], data["template_text"], json.dumps(variables), data.get("description"), now),
+        )
+    except aiosqlite.IntegrityError:
+        raise ValueError(f"Template '{data['name']}' already exists")
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM prompt_templates WHERE id = ?", (cur.lastrowid,))
+    return _prompt_template_row(rows[0])
+
+
+async def list_prompt_templates(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM prompt_templates ORDER BY times_used DESC, name ASC")
+    return [_prompt_template_row(r) for r in rows]
+
+
+async def get_prompt_template(db: aiosqlite.Connection, tpl_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM prompt_templates WHERE id = ?", (tpl_id,))
+    return _prompt_template_row(rows[0]) if rows else None
+
+
+async def update_prompt_template(db: aiosqlite.Connection, tpl_id: int, updates: dict) -> dict | None:
+    existing = await get_prompt_template(db, tpl_id)
+    if not existing:
+        return None
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return existing
+    if "template_text" in fields:
+        import json
+        fields["variables"] = json.dumps(_extract_variables(fields["template_text"]))
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [tpl_id]
+    try:
+        cur = await db.execute(f"UPDATE prompt_templates SET {set_clause} WHERE id = ?", values)
+    except aiosqlite.IntegrityError:
+        raise ValueError("Template with that name already exists")
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_prompt_template(db, tpl_id)
+
+
+async def delete_prompt_template(db: aiosqlite.Connection, tpl_id: int) -> bool:
+    cur = await db.execute("DELETE FROM prompt_templates WHERE id = ?", (tpl_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def render_prompt_template(db: aiosqlite.Connection, tpl_id: int,
+                                  variables: dict[str, str],
+                                  compress: bool = False,
+                                  profile_name: str | None = None) -> dict | None:
+    tpl = await get_prompt_template(db, tpl_id)
+    if not tpl:
+        return None
+
+    rendered = tpl["template_text"]
+    missing = []
+    for var in tpl["variables"]:
+        placeholder = "{{" + var + "}}"
+        if var in variables:
+            rendered = rendered.replace(placeholder, variables[var])
+        else:
+            missing.append(var)
+
+    from compressor import estimate_tokens, compress_prompt
+    rendered_tokens = estimate_tokens(rendered)
+
+    result = {
+        "rendered": rendered,
+        "rendered_tokens": rendered_tokens,
+        "compressed": None,
+        "compressed_tokens": None,
+        "savings_pct": None,
+        "missing_variables": missing,
+    }
+
+    if compress:
+        max_ratio = 0.5
+        preserve_code = True
+        strip_examples = False
+        strip_comments = False
+        if profile_name:
+            p = await get_profile(db, profile_name)
+            if p:
+                max_ratio = p["max_ratio"]
+                preserve_code = p["preserve_code"]
+                strip_examples = p["strip_examples"]
+                strip_comments = p["strip_comments"]
+        compressed = compress_prompt(rendered, max_ratio, preserve_code,
+                                     strip_examples=strip_examples, strip_comments=strip_comments)
+        compressed_tokens = estimate_tokens(compressed)
+        result["compressed"] = compressed
+        result["compressed_tokens"] = compressed_tokens
+        result["savings_pct"] = round((1 - compressed_tokens / max(rendered_tokens, 1)) * 100, 1)
+
+    # Increment usage counter
+    await db.execute("UPDATE prompt_templates SET times_used = times_used + 1 WHERE id = ?", (tpl_id,))
+    await db.commit()
+
+    return result
+
+
+def _prompt_template_row(r: aiosqlite.Row) -> dict:
+    import json
+    try:
+        variables = json.loads(r["variables"])
+    except (Exception,):
+        variables = []
+    return {
+        "id": r["id"], "name": r["name"], "template_text": r["template_text"],
+        "variables": variables, "description": r["description"],
+        "times_used": r["times_used"], "created_at": r["created_at"],
+    }
+
+
+# ── Compression History ──────────────────────────────────────────────────────
+
+async def list_compression_history(db: aiosqlite.Connection, profile: str | None = None,
+                                    limit: int = 50) -> list[dict]:
+    q = "SELECT * FROM compression_history WHERE 1=1"
+    params: list = []
+    if profile:
+        q += " AND profile_used = ?"
+        params.append(profile)
+    q += f" ORDER BY created_at DESC LIMIT {limit}"
+    rows = await db.execute_fetchall(q, params)
+    return [_comp_hist_row(r) for r in rows]
+
+
+async def get_compression_analytics(db: aiosqlite.Connection) -> dict:
+    total_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM compression_history")
+    total = total_rows[0]["cnt"] if total_rows else 0
+    if total == 0:
+        return {
+            "total_compressions": 0, "avg_ratio": 1.0, "avg_savings_pct": 0.0,
+            "best_ratio": 1.0, "worst_ratio": 1.0, "by_profile": [], "daily_trend": [],
+        }
+
+    agg = await db.execute_fetchall(
+        "SELECT AVG(compression_ratio) as avg_r, AVG(savings_pct) as avg_s, MIN(compression_ratio) as best_r, MAX(compression_ratio) as worst_r FROM compression_history"
+    )
+    a = agg[0]
+
+    # By profile
+    profile_rows = await db.execute_fetchall(
+        """SELECT COALESCE(profile_used, '(none)') as profile,
+           COUNT(*) as count, AVG(compression_ratio) as avg_ratio,
+           AVG(savings_pct) as avg_savings, SUM(original_tokens - compressed_tokens) as total_saved
+           FROM compression_history GROUP BY profile_used ORDER BY count DESC"""
+    )
+    by_profile = [{
+        "profile": r["profile"], "count": r["count"],
+        "avg_ratio": round(r["avg_ratio"], 3),
+        "avg_savings_pct": round(r["avg_savings"], 1),
+        "total_tokens_saved": r["total_saved"] or 0,
+    } for r in profile_rows]
+
+    # Daily trend (last 30 days)
+    trend_rows = await db.execute_fetchall(
+        """SELECT date(created_at) as day, COUNT(*) as count,
+           AVG(compression_ratio) as avg_ratio, AVG(savings_pct) as avg_savings
+           FROM compression_history
+           WHERE created_at >= date('now', '-30 days')
+           GROUP BY date(created_at) ORDER BY day ASC"""
+    )
+    daily_trend = [{
+        "day": r["day"], "compressions": r["count"],
+        "avg_ratio": round(r["avg_ratio"], 3),
+        "avg_savings_pct": round(r["avg_savings"], 1),
+    } for r in trend_rows]
+
+    return {
+        "total_compressions": total,
+        "avg_ratio": round(a["avg_r"], 3),
+        "avg_savings_pct": round(a["avg_s"], 1),
+        "best_ratio": round(a["best_r"], 3),
+        "worst_ratio": round(a["worst_r"], 3),
+        "by_profile": by_profile,
+        "daily_trend": daily_trend,
+    }
+
+
+def _comp_hist_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "prompt_preview": r["prompt_preview"] or "",
+        "profile_used": r["profile_used"],
+        "original_tokens": r["original_tokens"],
+        "compressed_tokens": r["compressed_tokens"],
+        "compression_ratio": r["compression_ratio"],
+        "savings_pct": r["savings_pct"],
+        "model": r["model"],
+        "created_at": r["created_at"],
+    }
+
+
+# ── Model Comparison ─────────────────────────────────────────────────────────
+
+async def compare_models(db: aiosqlite.Connection, prompt: str,
+                          compress: bool = False, profile_name: str | None = None) -> dict:
+    from compressor import estimate_tokens, compress_prompt
+
+    original_tokens = estimate_tokens(prompt)
+    compressed_tokens = None
+
+    if compress:
+        max_ratio = 0.5
+        preserve_code = True
+        strip_examples = False
+        strip_comments = False
+        if profile_name:
+            p = await get_profile(db, profile_name)
+            if p:
+                max_ratio = p["max_ratio"]
+                preserve_code = p["preserve_code"]
+                strip_examples = p["strip_examples"]
+                strip_comments = p["strip_comments"]
+        compressed = compress_prompt(prompt, max_ratio, preserve_code,
+                                     strip_examples=strip_examples, strip_comments=strip_comments)
+        compressed_tokens = estimate_tokens(compressed)
+
+    models = await list_model_costs(db)
+    if not models:
+        orig_cost = round(original_tokens * DEFAULT_COST_PER_1M / 1_000_000, 6)
+        item = {
+            "model": "(default)",
+            "input_tokens": original_tokens,
+            "input_cost_usd": orig_cost,
+            "compressed_tokens": compressed_tokens,
+            "compressed_cost_usd": round(compressed_tokens * DEFAULT_COST_PER_1M / 1_000_000, 6) if compressed_tokens else None,
+            "savings_usd": round((original_tokens - compressed_tokens) * DEFAULT_COST_PER_1M / 1_000_000, 6) if compressed_tokens else None,
+            "savings_pct": round((1 - compressed_tokens / max(original_tokens, 1)) * 100, 1) if compressed_tokens else None,
+        }
+        return {
+            "original_tokens": original_tokens,
+            "compressed_tokens": compressed_tokens,
+            "models_compared": 1,
+            "results": [item],
+            "cheapest_model": "(default)",
+            "best_savings_model": "(default)" if compressed_tokens else None,
+        }
+
+    results = []
+    for m in models:
+        orig_cost = round(original_tokens * m["input_cost_per_1m"] / 1_000_000, 6)
+        comp_cost = round(compressed_tokens * m["input_cost_per_1m"] / 1_000_000, 6) if compressed_tokens else None
+        savings = round(orig_cost - comp_cost, 6) if comp_cost is not None else None
+        savings_pct_val = round((1 - compressed_tokens / max(original_tokens, 1)) * 100, 1) if compressed_tokens else None
+        results.append({
+            "model": m["name"],
+            "input_tokens": original_tokens,
+            "input_cost_usd": orig_cost,
+            "compressed_tokens": compressed_tokens,
+            "compressed_cost_usd": comp_cost,
+            "savings_usd": savings,
+            "savings_pct": savings_pct_val,
+        })
+
+    results.sort(key=lambda x: x["input_cost_usd"])
+    cheapest = results[0]["model"] if results else None
+    best_savings = max(results, key=lambda x: x["savings_usd"] or 0)["model"] if compressed_tokens and results else None
+
+    return {
+        "original_tokens": original_tokens,
+        "compressed_tokens": compressed_tokens,
+        "models_compared": len(results),
+        "results": results,
+        "cheapest_model": cheapest,
+        "best_savings_model": best_savings,
     }
