@@ -95,6 +95,8 @@ class UsageStats(BaseModel):
     compression_history_entries: int
     total_rules: int
     total_quotas: int
+    total_alert_rules: int
+    total_ab_experiments: int
 
 
 class CachePurgeRequest(BaseModel):
@@ -255,6 +257,7 @@ class PromptTemplateUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     template_text: Optional[str] = Field(None, min_length=1)
     description: Optional[str] = Field(None, max_length=500)
+    change_description: Optional[str] = Field(None, max_length=300, description="Description of what changed (stored in version history)")
 
 
 class PromptTemplateResponse(BaseModel):
@@ -264,6 +267,7 @@ class PromptTemplateResponse(BaseModel):
     variables: list[str]
     description: Optional[str]
     times_used: int
+    version: int
     created_at: str
 
 
@@ -400,3 +404,128 @@ class UsageQuotaResponse(BaseModel):
     monthly_remaining: Optional[int]
     over_quota: bool
     created_at: str
+
+
+# ── Prompt Versioning (v0.9.0) ───────────────────────────────────────────────
+
+class TemplateVersionResponse(BaseModel):
+    id: int
+    template_id: int
+    version_number: int
+    template_text: str
+    variables: list[str]
+    change_description: Optional[str]
+    tokens_count: int
+    created_at: str
+
+
+class TemplateVersionDiff(BaseModel):
+    version_a: int
+    version_b: int
+    text_a_preview: str
+    text_b_preview: str
+    tokens_a: int
+    tokens_b: int
+    token_diff: int
+    token_change_pct: float
+
+
+class TemplateRollbackRequest(BaseModel):
+    version_number: int = Field(..., ge=1, description="Version number to rollback to")
+
+
+# ── Cost Alerts (v0.9.0) ────────────────────────────────────────────────────
+
+class AlertRuleCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Alert rule name (must be unique)")
+    condition_type: str = Field(..., description="One of: spend_exceeds, hit_rate_below, tokens_exceed, compression_ratio_below")
+    threshold: float = Field(..., description="Threshold value for the condition")
+    period: str = Field("daily", description="Period: daily, weekly, or monthly")
+    is_enabled: bool = Field(True, description="Whether this rule is active")
+
+
+class AlertRuleUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    threshold: Optional[float] = None
+    period: Optional[str] = None
+    is_enabled: Optional[bool] = None
+
+
+class AlertRuleResponse(BaseModel):
+    id: int
+    name: str
+    condition_type: str
+    threshold: float
+    period: str
+    is_enabled: bool
+    times_triggered: int
+    last_triggered_at: Optional[str]
+    created_at: str
+
+
+class AlertLogEntry(BaseModel):
+    id: int
+    rule_id: int
+    rule_name: str
+    condition_type: str
+    threshold: float
+    actual_value: float
+    message: str
+    is_acknowledged: bool
+    triggered_at: str
+    acknowledged_at: Optional[str]
+
+
+class AlertSummary(BaseModel):
+    total_rules: int
+    active_rules: int
+    total_alerts: int
+    unacknowledged: int
+    recent_alerts: list[AlertLogEntry]
+
+
+# ── Compression A/B Testing (v0.9.0) ────────────────────────────────────────
+
+class ABExperimentCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Experiment name")
+    profile_a: str = Field(..., description="First compression profile name")
+    profile_b: str = Field(..., description="Second compression profile name")
+
+
+class ABExperimentResponse(BaseModel):
+    id: int
+    name: str
+    profile_a: str
+    profile_b: str
+    status: str
+    tests_count: int
+    profile_a_wins: int
+    profile_b_wins: int
+    ties: int
+    win_rate_a: float
+    win_rate_b: float
+    created_at: str
+    completed_at: Optional[str]
+
+
+class ABTestPromptRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, description="Prompt text to test with both profiles")
+
+
+class ABTestResultResponse(BaseModel):
+    id: int
+    experiment_id: int
+    prompt_preview: str
+    profile_a_tokens: int
+    profile_b_tokens: int
+    profile_a_ratio: float
+    profile_b_ratio: float
+    winner: str
+    tested_at: str
+
+
+class ABExperimentSummary(BaseModel):
+    total_experiments: int
+    running: int
+    completed: int
+    total_tests: int
