@@ -24,6 +24,12 @@ from models import (
     CompressionRuleCreate, CompressionRuleUpdate, CompressionRuleResponse,
     PromptDiffRequest, PromptDiffResponse,
     UsageQuotaSet, UsageQuotaResponse,
+    # v0.9.0
+    TemplateVersionResponse, TemplateVersionDiff, TemplateRollbackRequest,
+    AlertRuleCreate, AlertRuleUpdate, AlertRuleResponse,
+    AlertLogEntry, AlertSummary,
+    ABExperimentCreate, ABExperimentResponse,
+    ABTestPromptRequest, ABTestResultResponse, ABExperimentSummary,
 )
 from compressor import compress_prompt, estimate_tokens
 from cache import (
@@ -43,6 +49,14 @@ from cache import (
     get_active_rules, increment_rule_applied,
     prompt_diff,
     set_usage_quota, get_usage_quota, list_usage_quotas, delete_usage_quota,
+    # v0.9.0 — Prompt Versioning
+    list_template_versions, get_template_version, diff_template_versions, rollback_template,
+    # v0.9.0 — Cost Alerts
+    create_alert_rule, list_alert_rules, get_alert_rule, update_alert_rule, delete_alert_rule,
+    evaluate_alerts, list_alert_log, acknowledge_alert, get_alert_summary,
+    # v0.9.0 — A/B Testing
+    create_ab_experiment, list_ab_experiments, get_ab_experiment,
+    run_ab_test, complete_ab_experiment, delete_ab_experiment, get_ab_experiment_results,
 )
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
@@ -60,11 +74,12 @@ app = FastAPI(
     description=(
         "LLM API cost optimizer: prompt compression, semantic caching, batch dedup, "
         "model cost profiles, cost estimation, compression benchmarks, budget tracking, "
-        "prompt templates with variable substitution, compression history analytics, "
-        "cross-model cost comparison, custom compression rules, prompt diff analysis, "
-        "and per-model usage quotas."
+        "prompt templates with variable substitution and version history, compression "
+        "history analytics, cross-model cost comparison, custom compression rules, "
+        "prompt diff analysis, per-model usage quotas, configurable cost alerts, "
+        "and compression A/B testing."
     ),
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -72,7 +87,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.8.0"}
+    return {"status": "ok", "version": "0.9.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
@@ -116,6 +131,13 @@ async def compress(req: CompressRequest):
         app.state.db, original_tokens, compressed_tokens,
         profile=profile_used, prompt_preview=req.prompt[:120],
     )
+
+    # Fire-and-forget alert evaluation
+    try:
+        await evaluate_alerts(app.state.db)
+    except Exception:
+        pass
+
     return CompressResponse(
         original=req.prompt,
         compressed=compressed,
@@ -310,6 +332,195 @@ async def render_template(tpl_id: int, body: PromptTemplateRenderRequest):
     if not result:
         raise HTTPException(404, "Template not found")
     return result
+
+
+# ── Template Versioning (v0.9.0) ──────────────────────────────────────────
+
+@app.get("/templates/{tpl_id}/versions", response_model=list[TemplateVersionResponse])
+async def get_template_versions(tpl_id: int):
+    """List all historical versions for a template, newest first."""
+    versions = await list_template_versions(app.state.db, tpl_id)
+    if versions is None:
+        raise HTTPException(404, "Template not found")
+    return versions
+
+
+@app.get("/templates/versions/{version_id}", response_model=TemplateVersionResponse)
+async def get_version_detail(version_id: int):
+    """Get a specific template version by its ID."""
+    version = await get_template_version(app.state.db, version_id)
+    if not version:
+        raise HTTPException(404, "Template version not found")
+    return version
+
+
+@app.get("/templates/{tpl_id}/versions/diff", response_model=TemplateVersionDiff)
+async def diff_versions(
+    tpl_id: int,
+    a: int = Query(..., ge=1, description="First version number"),
+    b: int = Query(..., ge=1, description="Second version number"),
+):
+    """Compare two template versions side by side: token counts and previews."""
+    if a == b:
+        raise HTTPException(422, "Version numbers must be different")
+    result = await diff_template_versions(app.state.db, tpl_id, a, b)
+    if result is None:
+        raise HTTPException(404, "Template or one of the versions not found")
+    return result
+
+
+@app.post("/templates/{tpl_id}/rollback", response_model=PromptTemplateResponse)
+async def rollback_template_endpoint(tpl_id: int, body: TemplateRollbackRequest):
+    """Rollback a template to a previous version. Current version is saved to history."""
+    try:
+        result = await rollback_template(app.state.db, tpl_id, body.version_number)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if result is None:
+        raise HTTPException(404, "Template not found")
+    return result
+
+
+# ── Cost Alerts (v0.9.0) ─────────────────────────────────────────────────────
+
+@app.post("/alerts/rules", response_model=AlertRuleResponse, status_code=201)
+async def add_alert_rule(body: AlertRuleCreate):
+    """Create a configurable cost/performance alert rule."""
+    try:
+        return await create_alert_rule(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/alerts/rules", response_model=list[AlertRuleResponse])
+async def get_alert_rules():
+    """List all alert rules."""
+    return await list_alert_rules(app.state.db)
+
+
+@app.get("/alerts/rules/{rule_id}", response_model=AlertRuleResponse)
+async def get_alert_rule_detail(rule_id: int):
+    rule = await get_alert_rule(app.state.db, rule_id)
+    if not rule:
+        raise HTTPException(404, "Alert rule not found")
+    return rule
+
+
+@app.patch("/alerts/rules/{rule_id}", response_model=AlertRuleResponse)
+async def patch_alert_rule(rule_id: int, body: AlertRuleUpdate):
+    try:
+        result = await update_alert_rule(app.state.db, rule_id, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if not result:
+        raise HTTPException(404, "Alert rule not found")
+    return result
+
+
+@app.delete("/alerts/rules/{rule_id}", status_code=204)
+async def remove_alert_rule(rule_id: int):
+    ok = await delete_alert_rule(app.state.db, rule_id)
+    if not ok:
+        raise HTTPException(404, "Alert rule not found")
+
+
+@app.post("/alerts/evaluate", response_model=list[dict])
+async def evaluate_alerts_endpoint():
+    """Manually evaluate all enabled alert rules and return any newly triggered alerts."""
+    return await evaluate_alerts(app.state.db)
+
+
+@app.get("/alerts/log", response_model=list[AlertLogEntry])
+async def get_alerts_log(
+    rule_id: int | None = Query(None, description="Filter by alert rule ID"),
+    acknowledged: bool | None = Query(None, description="Filter by acknowledgement status"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """View alert history with optional filters."""
+    return await list_alert_log(app.state.db, rule_id, acknowledged, limit)
+
+
+@app.post("/alerts/{alert_id}/acknowledge", response_model=AlertLogEntry)
+async def acknowledge_alert_endpoint(alert_id: int):
+    """Acknowledge (dismiss) an alert log entry."""
+    result = await acknowledge_alert(app.state.db, alert_id)
+    if not result:
+        raise HTTPException(404, "Alert log entry not found")
+    return result
+
+
+@app.get("/alerts/summary", response_model=AlertSummary)
+async def alert_summary():
+    """Get a summary of all alert rules and recent alerts."""
+    return await get_alert_summary(app.state.db)
+
+
+# ── Compression A/B Testing (v0.9.0) ─────────────────────────────────────────
+
+@app.post("/ab-experiments", response_model=ABExperimentResponse, status_code=201)
+async def add_ab_experiment(body: ABExperimentCreate):
+    """Create a new A/B experiment to compare two compression profiles."""
+    try:
+        return await create_ab_experiment(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/ab-experiments", response_model=list[ABExperimentResponse])
+async def get_ab_experiments():
+    """List all A/B experiments."""
+    return await list_ab_experiments(app.state.db)
+
+
+@app.get("/ab-experiments/{exp_id}", response_model=ABExperimentResponse)
+async def get_ab_experiment_detail(exp_id: int):
+    exp = await get_ab_experiment(app.state.db, exp_id)
+    if not exp:
+        raise HTTPException(404, "A/B experiment not found")
+    return exp
+
+
+@app.post("/ab-experiments/{exp_id}/test", response_model=ABTestResultResponse)
+async def run_ab_test_endpoint(exp_id: int, body: ABTestPromptRequest):
+    """Run a single test within an A/B experiment: compress with both profiles and record winner."""
+    try:
+        result = await run_ab_test(app.state.db, exp_id, body.prompt)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if result is None:
+        raise HTTPException(404, "A/B experiment not found")
+    return result
+
+
+@app.post("/ab-experiments/{exp_id}/complete", response_model=ABExperimentResponse)
+async def complete_ab_experiment_endpoint(exp_id: int):
+    """Mark an A/B experiment as completed."""
+    try:
+        result = await complete_ab_experiment(app.state.db, exp_id)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if result is None:
+        raise HTTPException(404, "A/B experiment not found")
+    return result
+
+
+@app.delete("/ab-experiments/{exp_id}", status_code=204)
+async def remove_ab_experiment(exp_id: int):
+    ok = await delete_ab_experiment(app.state.db, exp_id)
+    if not ok:
+        raise HTTPException(404, "A/B experiment not found")
+
+
+@app.get("/ab-experiments/{exp_id}/results", response_model=list[ABTestResultResponse])
+async def get_ab_results(
+    exp_id: int,
+    limit: int = Query(50, ge=1, le=500),
+):
+    """View individual test results for an A/B experiment."""
+    results = await get_ab_experiment_results(app.state.db, exp_id, limit)
+    if results is None:
+        raise HTTPException(404, "A/B experiment not found")
+    return results
 
 
 # ── Compression History ────────────────────────────────────────────────────
@@ -517,6 +728,12 @@ async def batch_process(req: BatchRequest):
             response=mock_response, tokens_used=tokens,
         ))
         total_used += tokens
+
+    # Fire-and-forget alert evaluation after batch processing
+    try:
+        await evaluate_alerts(app.state.db)
+    except Exception:
+        pass
 
     return BatchResponse(
         results=results,
