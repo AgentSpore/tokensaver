@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import re
 from datetime import datetime, timezone
 import aiosqlite
@@ -72,6 +73,10 @@ BUILTIN_PROFILES = [
 
 DEFAULT_COST_PER_1M = 0.15
 
+VALID_CONDITION_TYPES = {"spend_exceeds", "hit_rate_below", "tokens_exceed", "compression_ratio_below"}
+VALID_PERIODS = {"daily", "weekly", "monthly"}
+VALID_AB_STATUSES = {"running", "completed"}
+
 
 async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
@@ -89,6 +94,9 @@ async def init_db(path: str) -> aiosqlite.Connection:
     await _migrate_compression_history(db)
     await _migrate_compression_rules(db)
     await _migrate_usage_quotas(db)
+    await _migrate_template_versions(db)
+    await _migrate_alert_rules(db)
+    await _migrate_ab_experiments(db)
     await db.commit()
     return db
 
@@ -114,9 +122,15 @@ async def _migrate_prompt_templates(db: aiosqlite.Connection):
             variables TEXT NOT NULL DEFAULT '[]',
             description TEXT,
             times_used INTEGER NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )
     """)
+    # Add version column if missing (migration from v0.8.0)
+    try:
+        await db.execute("ALTER TABLE prompt_templates ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+    except Exception:
+        pass
 
 
 async def _migrate_compression_history(db: aiosqlite.Connection):
@@ -164,8 +178,100 @@ async def _migrate_usage_quotas(db: aiosqlite.Connection):
     """)
 
 
+# ── v0.9.0 Migrations ───────────────────────────────────────────────────────
+
+async def _migrate_template_versions(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS template_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            version_number INTEGER NOT NULL,
+            template_text TEXT NOT NULL,
+            variables TEXT NOT NULL DEFAULT '[]',
+            change_description TEXT,
+            tokens_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (template_id) REFERENCES prompt_templates(id) ON DELETE CASCADE
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_tpl_ver_template ON template_versions(template_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_tpl_ver_number ON template_versions(template_id, version_number)")
+
+
+async def _migrate_alert_rules(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            condition_type TEXT NOT NULL,
+            threshold REAL NOT NULL,
+            period TEXT NOT NULL DEFAULT 'daily',
+            is_enabled INTEGER NOT NULL DEFAULT 1,
+            times_triggered INTEGER NOT NULL DEFAULT 0,
+            last_triggered_at TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS alert_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id INTEGER NOT NULL,
+            rule_name TEXT NOT NULL,
+            condition_type TEXT NOT NULL,
+            threshold REAL NOT NULL,
+            actual_value REAL NOT NULL,
+            message TEXT NOT NULL,
+            is_acknowledged INTEGER NOT NULL DEFAULT 0,
+            triggered_at TEXT NOT NULL,
+            acknowledged_at TEXT,
+            FOREIGN KEY (rule_id) REFERENCES alert_rules(id) ON DELETE CASCADE
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_alert_log_rule ON alert_log(rule_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_alert_log_ack ON alert_log(is_acknowledged)")
+
+
+async def _migrate_ab_experiments(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS ab_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            profile_a TEXT NOT NULL,
+            profile_b TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            tests_count INTEGER NOT NULL DEFAULT 0,
+            profile_a_wins INTEGER NOT NULL DEFAULT 0,
+            profile_b_wins INTEGER NOT NULL DEFAULT 0,
+            ties INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS ab_experiment_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id INTEGER NOT NULL,
+            prompt_preview TEXT,
+            profile_a_tokens INTEGER NOT NULL,
+            profile_b_tokens INTEGER NOT NULL,
+            profile_a_ratio REAL NOT NULL,
+            profile_b_ratio REAL NOT NULL,
+            winner TEXT NOT NULL,
+            tested_at TEXT NOT NULL,
+            FOREIGN KEY (experiment_id) REFERENCES ab_experiments(id) ON DELETE CASCADE
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_ab_results_exp ON ab_experiment_results(experiment_id)")
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
 def _hash(prompt: str, model: str = "") -> str:
     return hashlib.sha256(f"{model}:{prompt}".encode()).hexdigest()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _today() -> str:
@@ -207,7 +313,7 @@ async def create_compression_rule(db: aiosqlite.Connection, data: dict) -> dict:
         _re.compile(data["pattern"])
     except _re.error as e:
         raise ValueError(f"Invalid regex pattern: {e}")
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO compression_rules (pattern, replacement, priority, description, created_at) VALUES (?, ?, ?, ?, ?)",
         (data["pattern"], data.get("replacement", ""), data.get("priority", 50), data.get("description"), now),
@@ -359,7 +465,7 @@ async def prompt_diff(db: aiosqlite.Connection, prompt_a: str, prompt_b: str,
 
 async def set_usage_quota(db: aiosqlite.Connection, model: str,
                           daily_limit: int | None, monthly_limit: int | None) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         """INSERT INTO usage_quotas (model, daily_token_limit, monthly_token_limit, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?)
@@ -433,7 +539,7 @@ async def delete_usage_quota(db: aiosqlite.Connection, model: str) -> bool:
 # ── Compression Profiles ─────────────────────────────────────────────────────
 
 async def create_profile(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         await db.execute(
             """INSERT INTO profiles (name, max_ratio, preserve_code, strip_examples, strip_comments, builtin, description, created_at)
@@ -507,7 +613,7 @@ def _profile_row(r: aiosqlite.Row) -> dict:
 # ── Model Costs ──────────────────────────────────────────────────────────────
 
 async def create_model_cost(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         await db.execute(
             "INSERT INTO model_costs (name, input_cost_per_1m, output_cost_per_1m, description, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -566,7 +672,7 @@ async def cache_get(db: aiosqlite.Connection, prompt: str, model: str = "") -> d
         await db.commit()
         return None
     row = rows[0]
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute("UPDATE cache SET hits = hits + 1, last_hit = ? WHERE prompt_hash = ?", (now, h))
     await db.execute("UPDATE stats SET cache_hits = cache_hits + 1 WHERE id = 1")
     await _bump_daily(db, model, cache_hits=1, tokens_saved=row["tokens_saved"])
@@ -584,7 +690,7 @@ async def cache_get(db: aiosqlite.Connection, prompt: str, model: str = "") -> d
 
 async def cache_set(db: aiosqlite.Connection, prompt: str, model: str, response: str, tokens_used: int) -> str:
     h = _hash(prompt, model)
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     preview = prompt[:120]
     await db.execute(
         """INSERT INTO cache (prompt_hash, prompt_preview, response, model, tokens_saved, hits, created_at, last_hit)
@@ -636,6 +742,10 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     rule_count = rule_rows[0]["cnt"] if rule_rows else 0
     quota_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM usage_quotas")
     quota_count = quota_rows[0]["cnt"] if quota_rows else 0
+    alert_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM alert_rules")
+    alert_count = alert_rows[0]["cnt"] if alert_rows else 0
+    ab_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM ab_experiments")
+    ab_count = ab_rows[0]["cnt"] if ab_rows else 0
     avg_ratio = (
         round(s["sum_compression_ratio"] / s["compression_requests"], 3)
         if s["compression_requests"] > 0 else 1.0
@@ -655,6 +765,8 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "compression_history_entries": hist_count,
         "total_rules": rule_count,
         "total_quotas": quota_count,
+        "total_alert_rules": alert_count,
+        "total_ab_experiments": ab_count,
     }
 
 
@@ -691,7 +803,7 @@ async def record_compression(db: aiosqlite.Connection, original_tokens: int,
     await _bump_daily(db, model or "", compressions=1, tokens_saved=saved)
 
     # Record in compression history
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         """INSERT INTO compression_history
            (prompt_preview, profile_used, original_tokens, compressed_tokens, compression_ratio, savings_pct, model, created_at)
@@ -887,7 +999,7 @@ async def benchmark_profiles(db: aiosqlite.Connection, prompt: str) -> list[dict
 
 async def set_budget(db: aiosqlite.Connection, daily_limit: int | None,
                      monthly_limit: int | None, alert_threshold: float = 80.0) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         """INSERT INTO budgets (id, daily_token_limit, monthly_token_limit, alert_threshold_pct, updated_at)
            VALUES (1, ?, ?, ?, ?)
@@ -964,12 +1076,11 @@ def _extract_variables(template_text: str) -> list[str]:
 
 
 async def create_prompt_template(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     variables = _extract_variables(data["template_text"])
-    import json
     try:
         cur = await db.execute(
-            "INSERT INTO prompt_templates (name, template_text, variables, description, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO prompt_templates (name, template_text, variables, description, version, created_at) VALUES (?, ?, ?, ?, 1, ?)",
             (data["name"], data["template_text"], json.dumps(variables), data.get("description"), now),
         )
     except aiosqlite.IntegrityError:
@@ -993,12 +1104,35 @@ async def update_prompt_template(db: aiosqlite.Connection, tpl_id: int, updates:
     existing = await get_prompt_template(db, tpl_id)
     if not existing:
         return None
+
+    # Extract change_description before building field updates
+    change_description = updates.pop("change_description", None)
+
     fields = {k: v for k, v in updates.items() if v is not None}
     if not fields:
         return existing
+
+    # If template_text is being changed, save old version first
     if "template_text" in fields:
-        import json
+        from compressor import estimate_tokens
+        old_tokens = estimate_tokens(existing["template_text"])
+        old_variables = existing["variables"]
+        current_version = existing.get("version", 1)
+
+        # Save the OLD version to template_versions
+        now = _now()
+        await db.execute(
+            """INSERT INTO template_versions
+               (template_id, version_number, template_text, variables, change_description, tokens_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (tpl_id, current_version, existing["template_text"],
+             json.dumps(old_variables), change_description, old_tokens, now),
+        )
+
+        # Update variables and bump version
         fields["variables"] = json.dumps(_extract_variables(fields["template_text"]))
+        fields["version"] = current_version + 1
+
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [tpl_id]
     try:
@@ -1012,6 +1146,8 @@ async def update_prompt_template(db: aiosqlite.Connection, tpl_id: int, updates:
 
 
 async def delete_prompt_template(db: aiosqlite.Connection, tpl_id: int) -> bool:
+    # Also delete associated versions
+    await db.execute("DELETE FROM template_versions WHERE template_id = ?", (tpl_id,))
     cur = await db.execute("DELETE FROM prompt_templates WHERE id = ?", (tpl_id,))
     await db.commit()
     return cur.rowcount > 0
@@ -1073,15 +1209,635 @@ async def render_prompt_template(db: aiosqlite.Connection, tpl_id: int,
 
 
 def _prompt_template_row(r: aiosqlite.Row) -> dict:
-    import json
+    try:
+        variables = json.loads(r["variables"])
+    except (Exception,):
+        variables = []
+    # Handle version column gracefully for older schemas
+    try:
+        version = r["version"]
+    except (IndexError, KeyError):
+        version = 1
+    return {
+        "id": r["id"], "name": r["name"], "template_text": r["template_text"],
+        "variables": variables, "description": r["description"],
+        "times_used": r["times_used"], "version": version,
+        "created_at": r["created_at"],
+    }
+
+
+# ── Template Versioning (v0.9.0) ────────────────────────────────────────────
+
+async def list_template_versions(db: aiosqlite.Connection, template_id: int) -> list[dict]:
+    # Verify template exists
+    tpl = await get_prompt_template(db, template_id)
+    if not tpl:
+        return None  # Signals 404 from the endpoint
+    rows = await db.execute_fetchall(
+        "SELECT * FROM template_versions WHERE template_id = ? ORDER BY version_number DESC",
+        (template_id,),
+    )
+    return [_template_version_row(r) for r in rows]
+
+
+async def get_template_version(db: aiosqlite.Connection, version_id: int) -> dict | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM template_versions WHERE id = ?", (version_id,),
+    )
+    return _template_version_row(rows[0]) if rows else None
+
+
+async def diff_template_versions(db: aiosqlite.Connection, template_id: int,
+                                  version_a: int, version_b: int) -> dict | None:
+    from compressor import estimate_tokens
+
+    # Verify template exists
+    tpl = await get_prompt_template(db, template_id)
+    if not tpl:
+        return None
+
+    # Fetch both versions; also consider the current live version
+    ver_a_data = await _get_version_or_current(db, template_id, version_a, tpl)
+    ver_b_data = await _get_version_or_current(db, template_id, version_b, tpl)
+
+    if ver_a_data is None or ver_b_data is None:
+        return None
+
+    tokens_a = estimate_tokens(ver_a_data["template_text"])
+    tokens_b = estimate_tokens(ver_b_data["template_text"])
+    token_diff = tokens_b - tokens_a
+    token_change_pct = round(token_diff / max(tokens_a, 1) * 100, 1)
+
+    return {
+        "version_a": version_a,
+        "version_b": version_b,
+        "text_a_preview": ver_a_data["template_text"][:200],
+        "text_b_preview": ver_b_data["template_text"][:200],
+        "tokens_a": tokens_a,
+        "tokens_b": tokens_b,
+        "token_diff": token_diff,
+        "token_change_pct": token_change_pct,
+    }
+
+
+async def _get_version_or_current(db: aiosqlite.Connection, template_id: int,
+                                    version_number: int, current_tpl: dict) -> dict | None:
+    """Get a specific version of a template. If version_number matches the current
+    version, return the live template data instead of looking in the history table."""
+    if version_number == current_tpl.get("version", 1):
+        return {"template_text": current_tpl["template_text"]}
+    rows = await db.execute_fetchall(
+        "SELECT * FROM template_versions WHERE template_id = ? AND version_number = ?",
+        (template_id, version_number),
+    )
+    if not rows:
+        return None
+    return {"template_text": rows[0]["template_text"]}
+
+
+async def rollback_template(db: aiosqlite.Connection, template_id: int, version_number: int) -> dict | None:
+    """Rollback a template to a specific historical version. Saves the current version
+    to history before restoring."""
+    tpl = await get_prompt_template(db, template_id)
+    if not tpl:
+        return None
+
+    current_version = tpl.get("version", 1)
+
+    # Cannot rollback to the current version
+    if version_number == current_version:
+        raise ValueError(f"Template is already at version {version_number}")
+
+    # Fetch the target version
+    rows = await db.execute_fetchall(
+        "SELECT * FROM template_versions WHERE template_id = ? AND version_number = ?",
+        (template_id, version_number),
+    )
+    if not rows:
+        raise ValueError(f"Version {version_number} not found for this template")
+
+    target = rows[0]
+
+    # Save current as a new version entry before rollback
+    from compressor import estimate_tokens
+    now = _now()
+    old_tokens = estimate_tokens(tpl["template_text"])
+    await db.execute(
+        """INSERT INTO template_versions
+           (template_id, version_number, template_text, variables, change_description, tokens_count, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (template_id, current_version, tpl["template_text"],
+         json.dumps(tpl["variables"]), f"Before rollback to v{version_number}", old_tokens, now),
+    )
+
+    # Restore the target version's content
+    new_version = current_version + 1
+    new_variables = _extract_variables(target["template_text"])
+    await db.execute(
+        "UPDATE prompt_templates SET template_text = ?, variables = ?, version = ? WHERE id = ?",
+        (target["template_text"], json.dumps(new_variables), new_version, template_id),
+    )
+    await db.commit()
+
+    return await get_prompt_template(db, template_id)
+
+
+def _template_version_row(r: aiosqlite.Row) -> dict:
     try:
         variables = json.loads(r["variables"])
     except (Exception,):
         variables = []
     return {
-        "id": r["id"], "name": r["name"], "template_text": r["template_text"],
-        "variables": variables, "description": r["description"],
-        "times_used": r["times_used"], "created_at": r["created_at"],
+        "id": r["id"],
+        "template_id": r["template_id"],
+        "version_number": r["version_number"],
+        "template_text": r["template_text"],
+        "variables": variables,
+        "change_description": r["change_description"],
+        "tokens_count": r["tokens_count"],
+        "created_at": r["created_at"],
+    }
+
+
+# ── Cost Alerts (v0.9.0) ────────────────────────────────────────────────────
+
+async def create_alert_rule(db: aiosqlite.Connection, data: dict) -> dict:
+    condition = data["condition_type"]
+    if condition not in VALID_CONDITION_TYPES:
+        raise ValueError(f"Invalid condition_type: {condition}. Must be one of: {', '.join(sorted(VALID_CONDITION_TYPES))}")
+    period = data.get("period", "daily")
+    if period not in VALID_PERIODS:
+        raise ValueError(f"Invalid period: {period}. Must be one of: {', '.join(sorted(VALID_PERIODS))}")
+    now = _now()
+    try:
+        cur = await db.execute(
+            """INSERT INTO alert_rules (name, condition_type, threshold, period, is_enabled, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (data["name"], condition, data["threshold"], period,
+             int(data.get("is_enabled", True)), now),
+        )
+    except aiosqlite.IntegrityError:
+        raise ValueError(f"Alert rule '{data['name']}' already exists")
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM alert_rules WHERE id = ?", (cur.lastrowid,))
+    return _alert_rule_row(rows[0])
+
+
+async def list_alert_rules(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM alert_rules ORDER BY created_at DESC")
+    return [_alert_rule_row(r) for r in rows]
+
+
+async def get_alert_rule(db: aiosqlite.Connection, rule_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM alert_rules WHERE id = ?", (rule_id,))
+    return _alert_rule_row(rows[0]) if rows else None
+
+
+async def update_alert_rule(db: aiosqlite.Connection, rule_id: int, updates: dict) -> dict | None:
+    existing = await get_alert_rule(db, rule_id)
+    if not existing:
+        return None
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return existing
+    if "period" in fields and fields["period"] not in VALID_PERIODS:
+        raise ValueError(f"Invalid period: {fields['period']}. Must be one of: {', '.join(sorted(VALID_PERIODS))}")
+    if "is_enabled" in fields:
+        fields["is_enabled"] = int(fields["is_enabled"])
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [rule_id]
+    try:
+        cur = await db.execute(f"UPDATE alert_rules SET {set_clause} WHERE id = ?", values)
+    except aiosqlite.IntegrityError:
+        raise ValueError("Alert rule with that name already exists")
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_alert_rule(db, rule_id)
+
+
+async def delete_alert_rule(db: aiosqlite.Connection, rule_id: int) -> bool:
+    # Also clean up associated log entries
+    await db.execute("DELETE FROM alert_log WHERE rule_id = ?", (rule_id,))
+    cur = await db.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def evaluate_alerts(db: aiosqlite.Connection) -> list[dict]:
+    """Evaluate all enabled alert rules against current data.
+    Returns list of newly triggered alerts."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM alert_rules WHERE is_enabled = 1"
+    )
+    if not rows:
+        return []
+
+    triggered = []
+    now = _now()
+
+    for rule in rows:
+        condition = rule["condition_type"]
+        threshold = rule["threshold"]
+        period = rule["period"]
+        actual_value = await _compute_alert_metric(db, condition, period)
+
+        fired = False
+        if condition == "spend_exceeds":
+            fired = actual_value > threshold
+        elif condition == "hit_rate_below":
+            fired = actual_value < threshold
+        elif condition == "tokens_exceed":
+            fired = actual_value > threshold
+        elif condition == "compression_ratio_below":
+            fired = actual_value < threshold
+
+        if fired:
+            message = _format_alert_message(rule["name"], condition, threshold, actual_value, period)
+            await db.execute(
+                """INSERT INTO alert_log (rule_id, rule_name, condition_type, threshold, actual_value, message, triggered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (rule["id"], rule["name"], condition, threshold, actual_value, message, now),
+            )
+            await db.execute(
+                "UPDATE alert_rules SET times_triggered = times_triggered + 1, last_triggered_at = ? WHERE id = ?",
+                (now, rule["id"]),
+            )
+            triggered.append({
+                "rule_id": rule["id"],
+                "rule_name": rule["name"],
+                "condition_type": condition,
+                "threshold": threshold,
+                "actual_value": round(actual_value, 4),
+                "message": message,
+                "triggered_at": now,
+            })
+
+    if triggered:
+        await db.commit()
+
+    return triggered
+
+
+async def _compute_alert_metric(db: aiosqlite.Connection, condition: str, period: str) -> float:
+    """Compute the actual metric value for a given condition and period."""
+    if condition == "spend_exceeds":
+        tokens_used = await _get_period_tokens_used(db, period)
+        # Estimate cost based on default rate
+        return tokens_used * DEFAULT_COST_PER_1M / 1_000_000
+
+    elif condition == "tokens_exceed":
+        return float(await _get_period_tokens_used(db, period))
+
+    elif condition == "hit_rate_below":
+        hits, misses = await _get_period_cache_stats(db, period)
+        total = hits + misses
+        if total == 0:
+            return 100.0  # No data = no alert
+        return round(hits / total * 100, 2)
+
+    elif condition == "compression_ratio_below":
+        return await _get_period_avg_compression_ratio(db, period)
+
+    return 0.0
+
+
+async def _get_period_tokens_used(db: aiosqlite.Connection, period: str) -> int:
+    if period == "daily":
+        day_filter = _today()
+        rows = await db.execute_fetchall(
+            "SELECT COALESCE(SUM(tokens_used), 0) as total FROM daily_log WHERE day = ?", (day_filter,)
+        )
+    elif period == "weekly":
+        rows = await db.execute_fetchall(
+            "SELECT COALESCE(SUM(tokens_used), 0) as total FROM daily_log WHERE day >= date('now', '-7 days')"
+        )
+    else:  # monthly
+        month_prefix = _this_month()
+        rows = await db.execute_fetchall(
+            "SELECT COALESCE(SUM(tokens_used), 0) as total FROM daily_log WHERE day LIKE ?",
+            (month_prefix + "%",),
+        )
+    return rows[0]["total"] if rows else 0
+
+
+async def _get_period_cache_stats(db: aiosqlite.Connection, period: str) -> tuple[int, int]:
+    if period == "daily":
+        day_filter = _today()
+        rows = await db.execute_fetchall(
+            "SELECT COALESCE(SUM(cache_hits), 0) as hits, COALESCE(SUM(cache_misses), 0) as misses FROM daily_log WHERE day = ?",
+            (day_filter,),
+        )
+    elif period == "weekly":
+        rows = await db.execute_fetchall(
+            "SELECT COALESCE(SUM(cache_hits), 0) as hits, COALESCE(SUM(cache_misses), 0) as misses FROM daily_log WHERE day >= date('now', '-7 days')"
+        )
+    else:  # monthly
+        month_prefix = _this_month()
+        rows = await db.execute_fetchall(
+            "SELECT COALESCE(SUM(cache_hits), 0) as hits, COALESCE(SUM(cache_misses), 0) as misses FROM daily_log WHERE day LIKE ?",
+            (month_prefix + "%",),
+        )
+    if rows:
+        return rows[0]["hits"], rows[0]["misses"]
+    return 0, 0
+
+
+async def _get_period_avg_compression_ratio(db: aiosqlite.Connection, period: str) -> float:
+    if period == "daily":
+        day_filter = _today()
+        rows = await db.execute_fetchall(
+            "SELECT AVG(compression_ratio) as avg_r FROM compression_history WHERE date(created_at) = ?",
+            (day_filter,),
+        )
+    elif period == "weekly":
+        rows = await db.execute_fetchall(
+            "SELECT AVG(compression_ratio) as avg_r FROM compression_history WHERE created_at >= date('now', '-7 days')"
+        )
+    else:  # monthly
+        month_prefix = _this_month()
+        rows = await db.execute_fetchall(
+            "SELECT AVG(compression_ratio) as avg_r FROM compression_history WHERE created_at LIKE ?",
+            (month_prefix + "%",),
+        )
+    if rows and rows[0]["avg_r"] is not None:
+        return round(rows[0]["avg_r"], 4)
+    return 1.0  # No data = ratio 1.0 (no compression)
+
+
+def _format_alert_message(name: str, condition: str, threshold: float, actual: float, period: str) -> str:
+    if condition == "spend_exceeds":
+        return f"[{name}] {period.capitalize()} spend ${actual:.4f} exceeds threshold ${threshold:.4f}"
+    elif condition == "hit_rate_below":
+        return f"[{name}] {period.capitalize()} cache hit rate {actual:.1f}% is below threshold {threshold:.1f}%"
+    elif condition == "tokens_exceed":
+        return f"[{name}] {period.capitalize()} token usage {int(actual)} exceeds threshold {int(threshold)}"
+    elif condition == "compression_ratio_below":
+        return f"[{name}] {period.capitalize()} avg compression ratio {actual:.3f} is below threshold {threshold:.3f}"
+    return f"[{name}] Alert triggered: {condition} (actual={actual}, threshold={threshold})"
+
+
+async def list_alert_log(db: aiosqlite.Connection, rule_id: int | None = None,
+                          acknowledged: bool | None = None, limit: int = 50) -> list[dict]:
+    q = "SELECT * FROM alert_log WHERE 1=1"
+    params: list = []
+    if rule_id is not None:
+        q += " AND rule_id = ?"
+        params.append(rule_id)
+    if acknowledged is not None:
+        q += " AND is_acknowledged = ?"
+        params.append(int(acknowledged))
+    q += f" ORDER BY triggered_at DESC LIMIT {limit}"
+    rows = await db.execute_fetchall(q, params)
+    return [_alert_log_row(r) for r in rows]
+
+
+async def acknowledge_alert(db: aiosqlite.Connection, alert_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM alert_log WHERE id = ?", (alert_id,))
+    if not rows:
+        return None
+    if rows[0]["is_acknowledged"]:
+        return _alert_log_row(rows[0])
+    now = _now()
+    await db.execute(
+        "UPDATE alert_log SET is_acknowledged = 1, acknowledged_at = ? WHERE id = ?",
+        (now, alert_id),
+    )
+    await db.commit()
+    updated = await db.execute_fetchall("SELECT * FROM alert_log WHERE id = ?", (alert_id,))
+    return _alert_log_row(updated[0])
+
+
+async def get_alert_summary(db: aiosqlite.Connection) -> dict:
+    total_rules_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM alert_rules")
+    total_rules = total_rules_rows[0]["cnt"] if total_rules_rows else 0
+    active_rules_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM alert_rules WHERE is_enabled = 1")
+    active_rules = active_rules_rows[0]["cnt"] if active_rules_rows else 0
+    total_alerts_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM alert_log")
+    total_alerts = total_alerts_rows[0]["cnt"] if total_alerts_rows else 0
+    unack_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM alert_log WHERE is_acknowledged = 0")
+    unacknowledged = unack_rows[0]["cnt"] if unack_rows else 0
+    recent_rows = await db.execute_fetchall(
+        "SELECT * FROM alert_log ORDER BY triggered_at DESC LIMIT 10"
+    )
+    recent_alerts = [_alert_log_row(r) for r in recent_rows]
+    return {
+        "total_rules": total_rules,
+        "active_rules": active_rules,
+        "total_alerts": total_alerts,
+        "unacknowledged": unacknowledged,
+        "recent_alerts": recent_alerts,
+    }
+
+
+def _alert_rule_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "condition_type": r["condition_type"],
+        "threshold": r["threshold"],
+        "period": r["period"],
+        "is_enabled": bool(r["is_enabled"]),
+        "times_triggered": r["times_triggered"],
+        "last_triggered_at": r["last_triggered_at"],
+        "created_at": r["created_at"],
+    }
+
+
+def _alert_log_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "rule_id": r["rule_id"],
+        "rule_name": r["rule_name"],
+        "condition_type": r["condition_type"],
+        "threshold": r["threshold"],
+        "actual_value": r["actual_value"],
+        "message": r["message"],
+        "is_acknowledged": bool(r["is_acknowledged"]),
+        "triggered_at": r["triggered_at"],
+        "acknowledged_at": r["acknowledged_at"],
+    }
+
+
+# ── Compression A/B Testing (v0.9.0) ────────────────────────────────────────
+
+async def create_ab_experiment(db: aiosqlite.Connection, data: dict) -> dict:
+    profile_a_name = data["profile_a"]
+    profile_b_name = data["profile_b"]
+
+    # Validate both profiles exist
+    pa = await get_profile(db, profile_a_name)
+    if not pa:
+        raise ValueError(f"Profile '{profile_a_name}' not found")
+    pb = await get_profile(db, profile_b_name)
+    if not pb:
+        raise ValueError(f"Profile '{profile_b_name}' not found")
+
+    if profile_a_name == profile_b_name:
+        raise ValueError("profile_a and profile_b must be different")
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO ab_experiments (name, profile_a, profile_b, status, created_at)
+           VALUES (?, ?, ?, 'running', ?)""",
+        (data["name"], profile_a_name, profile_b_name, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM ab_experiments WHERE id = ?", (cur.lastrowid,))
+    return _ab_experiment_row(rows[0])
+
+
+async def list_ab_experiments(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM ab_experiments ORDER BY created_at DESC")
+    return [_ab_experiment_row(r) for r in rows]
+
+
+async def get_ab_experiment(db: aiosqlite.Connection, experiment_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM ab_experiments WHERE id = ?", (experiment_id,))
+    return _ab_experiment_row(rows[0]) if rows else None
+
+
+async def run_ab_test(db: aiosqlite.Connection, experiment_id: int, prompt: str) -> dict | None:
+    """Run a single A/B test: compress the prompt with both profiles and record the result."""
+    from compressor import compress_prompt, estimate_tokens
+
+    exp = await get_ab_experiment(db, experiment_id)
+    if not exp:
+        return None
+
+    if exp["status"] != "running":
+        raise ValueError("Experiment is not running; cannot add more tests")
+
+    # Fetch both profiles
+    pa = await get_profile(db, exp["profile_a"])
+    pb = await get_profile(db, exp["profile_b"])
+    if not pa or not pb:
+        raise ValueError("One or both profiles no longer exist")
+
+    original_tokens = estimate_tokens(prompt)
+
+    # Compress with profile A
+    comp_a, _ = compress_prompt(
+        prompt, pa["max_ratio"], pa["preserve_code"],
+        strip_examples=pa["strip_examples"], strip_comments=pa["strip_comments"],
+    )
+    tokens_a = estimate_tokens(comp_a)
+    ratio_a = round(tokens_a / max(original_tokens, 1), 3)
+
+    # Compress with profile B
+    comp_b, _ = compress_prompt(
+        prompt, pb["max_ratio"], pb["preserve_code"],
+        strip_examples=pb["strip_examples"], strip_comments=pb["strip_comments"],
+    )
+    tokens_b = estimate_tokens(comp_b)
+    ratio_b = round(tokens_b / max(original_tokens, 1), 3)
+
+    # Determine winner (lower tokens = better compression = winner)
+    if tokens_a < tokens_b:
+        winner = "a"
+    elif tokens_b < tokens_a:
+        winner = "b"
+    else:
+        winner = "tie"
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO ab_experiment_results
+           (experiment_id, prompt_preview, profile_a_tokens, profile_b_tokens,
+            profile_a_ratio, profile_b_ratio, winner, tested_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (experiment_id, prompt[:120], tokens_a, tokens_b, ratio_a, ratio_b, winner, now),
+    )
+
+    # Update experiment counters
+    win_update = ""
+    if winner == "a":
+        win_update = ", profile_a_wins = profile_a_wins + 1"
+    elif winner == "b":
+        win_update = ", profile_b_wins = profile_b_wins + 1"
+    else:
+        win_update = ", ties = ties + 1"
+    await db.execute(
+        f"UPDATE ab_experiments SET tests_count = tests_count + 1{win_update} WHERE id = ?",
+        (experiment_id,),
+    )
+    await db.commit()
+
+    result_rows = await db.execute_fetchall(
+        "SELECT * FROM ab_experiment_results WHERE id = ?", (cur.lastrowid,),
+    )
+    return _ab_test_result_row(result_rows[0])
+
+
+async def complete_ab_experiment(db: aiosqlite.Connection, experiment_id: int) -> dict | None:
+    exp = await get_ab_experiment(db, experiment_id)
+    if not exp:
+        return None
+    if exp["status"] == "completed":
+        raise ValueError("Experiment is already completed")
+    if exp["tests_count"] == 0:
+        raise ValueError("Cannot complete an experiment with no tests")
+
+    now = _now()
+    await db.execute(
+        "UPDATE ab_experiments SET status = 'completed', completed_at = ? WHERE id = ?",
+        (now, experiment_id),
+    )
+    await db.commit()
+    return await get_ab_experiment(db, experiment_id)
+
+
+async def delete_ab_experiment(db: aiosqlite.Connection, experiment_id: int) -> bool:
+    await db.execute("DELETE FROM ab_experiment_results WHERE experiment_id = ?", (experiment_id,))
+    cur = await db.execute("DELETE FROM ab_experiments WHERE id = ?", (experiment_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_ab_experiment_results(db: aiosqlite.Connection, experiment_id: int,
+                                     limit: int = 50) -> list[dict] | None:
+    exp = await get_ab_experiment(db, experiment_id)
+    if not exp:
+        return None
+    rows = await db.execute_fetchall(
+        "SELECT * FROM ab_experiment_results WHERE experiment_id = ? ORDER BY tested_at DESC LIMIT ?",
+        (experiment_id, limit),
+    )
+    return [_ab_test_result_row(r) for r in rows]
+
+
+def _ab_experiment_row(r: aiosqlite.Row) -> dict:
+    tests = r["tests_count"]
+    a_wins = r["profile_a_wins"]
+    b_wins = r["profile_b_wins"]
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "profile_a": r["profile_a"],
+        "profile_b": r["profile_b"],
+        "status": r["status"],
+        "tests_count": tests,
+        "profile_a_wins": a_wins,
+        "profile_b_wins": b_wins,
+        "ties": r["ties"],
+        "win_rate_a": round(a_wins / max(tests, 1) * 100, 1),
+        "win_rate_b": round(b_wins / max(tests, 1) * 100, 1),
+        "created_at": r["created_at"],
+        "completed_at": r["completed_at"],
+    }
+
+
+def _ab_test_result_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "experiment_id": r["experiment_id"],
+        "prompt_preview": r["prompt_preview"] or "",
+        "profile_a_tokens": r["profile_a_tokens"],
+        "profile_b_tokens": r["profile_b_tokens"],
+        "profile_a_ratio": r["profile_a_ratio"],
+        "profile_b_ratio": r["profile_b_ratio"],
+        "winner": r["winner"],
+        "tested_at": r["tested_at"],
     }
 
 
