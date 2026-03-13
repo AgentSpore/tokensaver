@@ -83,8 +83,22 @@ async def init_db(path: str) -> aiosqlite.Connection:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             p,
         )
+    await _migrate_budgets(db)
     await db.commit()
     return db
+
+
+async def _migrate_budgets(db: aiosqlite.Connection):
+    """Create budgets table if it doesn't exist."""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            daily_token_limit INTEGER,
+            monthly_token_limit INTEGER,
+            alert_threshold_pct REAL NOT NULL DEFAULT 80.0,
+            updated_at TEXT NOT NULL
+        )
+    """)
 
 
 def _hash(prompt: str, model: str = "") -> str:
@@ -93,6 +107,10 @@ def _hash(prompt: str, model: str = "") -> str:
 
 def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _this_month() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 async def _get_model_cost(db: aiosqlite.Connection, model: str) -> float:
@@ -484,3 +502,146 @@ async def export_daily_csv(db: aiosqlite.Connection, days: int = 90, model: str 
     writer.writeheader()
     writer.writerows(rows)
     return output.getvalue()
+
+
+# ── Cost Estimation ──────────────────────────────────────────────────────────
+
+async def estimate_cost(db: aiosqlite.Connection, token_count: int,
+                        model: str | None = None) -> list[dict]:
+    """Estimate cost for a given token count across all registered models or a specific one."""
+    if model:
+        rows = await db.execute_fetchall("SELECT * FROM model_costs WHERE name = ?", (model,))
+    else:
+        rows = await db.execute_fetchall("SELECT * FROM model_costs ORDER BY input_cost_per_1m ASC")
+    if not rows:
+        # Return default estimate
+        default_cost = round(token_count * DEFAULT_COST_PER_1M / 1_000_000, 6)
+        return [{
+            "model": "(default)",
+            "input_tokens": token_count,
+            "input_cost_usd": default_cost,
+            "output_cost_usd_per_1k": round(0.60 / 1000, 6),
+            "total_estimate_usd": default_cost,
+        }]
+    results = []
+    for r in rows:
+        input_cost = round(token_count * r["input_cost_per_1m"] / 1_000_000, 6)
+        output_cost_1k = round(r["output_cost_per_1m"] / 1000, 6)
+        results.append({
+            "model": r["name"],
+            "input_tokens": token_count,
+            "input_cost_usd": input_cost,
+            "output_cost_usd_per_1k": output_cost_1k,
+            "total_estimate_usd": input_cost,
+        })
+    return results
+
+
+# ── Compression Benchmark ────────────────────────────────────────────────────
+
+async def benchmark_profiles(db: aiosqlite.Connection, prompt: str) -> list[dict]:
+    """Compress the same prompt with all profiles and compare results."""
+    from compressor import compress_prompt, estimate_tokens
+
+    profiles = await list_profiles(db)
+    original_tokens = estimate_tokens(prompt)
+    results = []
+    for p in profiles:
+        compressed = compress_prompt(
+            prompt, p["max_ratio"], p["preserve_code"],
+            strip_examples=p["strip_examples"],
+            strip_comments=p["strip_comments"],
+        )
+        compressed_tokens = estimate_tokens(compressed)
+        savings_pct = round((1 - compressed_tokens / max(original_tokens, 1)) * 100, 1)
+        results.append({
+            "profile": p["name"],
+            "builtin": p["builtin"],
+            "max_ratio": p["max_ratio"],
+            "original_tokens": original_tokens,
+            "compressed_tokens": compressed_tokens,
+            "savings_pct": savings_pct,
+            "compression_ratio": round(compressed_tokens / max(original_tokens, 1), 3),
+            "compressed_preview": compressed[:200],
+        })
+    results.sort(key=lambda x: x["savings_pct"], reverse=True)
+    return results
+
+
+# ── Budget Tracking ──────────────────────────────────────────────────────────
+
+async def set_budget(db: aiosqlite.Connection, daily_limit: int | None,
+                     monthly_limit: int | None, alert_threshold: float = 80.0) -> dict:
+    """Set or update token budget limits."""
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        """INSERT INTO budgets (id, daily_token_limit, monthly_token_limit, alert_threshold_pct, updated_at)
+           VALUES (1, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             daily_token_limit = excluded.daily_token_limit,
+             monthly_token_limit = excluded.monthly_token_limit,
+             alert_threshold_pct = excluded.alert_threshold_pct,
+             updated_at = excluded.updated_at""",
+        (daily_limit, monthly_limit, alert_threshold, now),
+    )
+    await db.commit()
+    return await get_budget_status(db)
+
+
+async def get_budget_status(db: aiosqlite.Connection) -> dict:
+    """Get current budget status with usage vs limits."""
+    budget_rows = await db.execute_fetchall("SELECT * FROM budgets WHERE id = 1")
+    daily_limit = None
+    monthly_limit = None
+    alert_threshold = 80.0
+    if budget_rows:
+        b = budget_rows[0]
+        daily_limit = b["daily_token_limit"]
+        monthly_limit = b["monthly_token_limit"]
+        alert_threshold = b["alert_threshold_pct"]
+
+    # Today's usage
+    today = _today()
+    daily_rows = await db.execute_fetchall(
+        "SELECT COALESCE(SUM(tokens_used), 0) as used FROM daily_log WHERE day = ?", (today,)
+    )
+    daily_used = daily_rows[0]["used"] if daily_rows else 0
+
+    # This month's usage
+    month_prefix = _this_month()
+    monthly_rows = await db.execute_fetchall(
+        "SELECT COALESCE(SUM(tokens_used), 0) as used FROM daily_log WHERE day LIKE ?",
+        (month_prefix + "%",),
+    )
+    monthly_used = monthly_rows[0]["used"] if monthly_rows else 0
+
+    # Calculate percentages and alerts
+    daily_pct = round(daily_used / daily_limit * 100, 1) if daily_limit else 0.0
+    monthly_pct = round(monthly_used / monthly_limit * 100, 1) if monthly_limit else 0.0
+    daily_remaining = (daily_limit - daily_used) if daily_limit else None
+    monthly_remaining = (monthly_limit - monthly_used) if monthly_limit else None
+
+    alerts = []
+    if daily_limit and daily_pct >= alert_threshold:
+        alerts.append(f"Daily usage at {daily_pct}% ({daily_used}/{daily_limit} tokens)")
+    if monthly_limit and monthly_pct >= alert_threshold:
+        alerts.append(f"Monthly usage at {monthly_pct}% ({monthly_used}/{monthly_limit} tokens)")
+    if daily_limit and daily_used >= daily_limit:
+        alerts.append("DAILY BUDGET EXCEEDED")
+    if monthly_limit and monthly_used >= monthly_limit:
+        alerts.append("MONTHLY BUDGET EXCEEDED")
+
+    return {
+        "daily_token_limit": daily_limit,
+        "monthly_token_limit": monthly_limit,
+        "alert_threshold_pct": alert_threshold,
+        "daily_used": daily_used,
+        "daily_remaining": daily_remaining,
+        "daily_pct": daily_pct,
+        "monthly_used": monthly_used,
+        "monthly_remaining": monthly_remaining,
+        "monthly_pct": monthly_pct,
+        "over_budget": (daily_limit is not None and daily_used >= daily_limit) or
+                       (monthly_limit is not None and monthly_used >= monthly_limit),
+        "alerts": alerts,
+    }
