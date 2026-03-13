@@ -7,21 +7,44 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def apply_custom_rules(text: str, rules: list[dict]) -> tuple[str, int]:
+    """Apply user-defined regex compression rules sorted by priority.
+    Returns (transformed_text, rules_applied_count).
+    """
+    applied = 0
+    sorted_rules = sorted(rules, key=lambda r: r["priority"])
+    for rule in sorted_rules:
+        try:
+            new_text = re.sub(rule["pattern"], rule["replacement"], text, flags=re.IGNORECASE)
+            if new_text != text:
+                applied += 1
+                text = new_text
+        except re.error:
+            continue
+    return text, applied
+
+
 def compress_prompt(
     prompt: str,
     max_ratio: float = 0.5,
     preserve_code: bool = True,
     strip_examples: bool = False,
     strip_comments: bool = False,
-) -> str:
+    custom_rules: list[dict] | None = None,
+) -> tuple[str, int]:
     """
     Lightweight prompt compressor that:
     1. Strips redundant whitespace
     2. Removes verbose filler phrases
     3. Optionally strips examples and comments
-    4. Condenses repeated patterns
-    5. Abbreviates common instructions
+    4. Applies custom compression rules
+    5. Condenses repeated patterns
+    6. Abbreviates common instructions
+
+    Returns (compressed_text, rules_applied_count).
     """
+    rules_applied = 0
+
     # Step 0: preserve code blocks
     code_blocks: list[str] = []
     if preserve_code:
@@ -41,6 +64,10 @@ def compress_prompt(
     if strip_comments:
         prompt = re.sub(r"(?m)^\s*(?://|#)\s.*$", "", prompt)
         prompt = re.sub(r"\s+(?://|#)\s.*$", "", prompt, flags=re.MULTILINE)
+
+    # Step 2.5: apply custom compression rules
+    if custom_rules:
+        prompt, rules_applied = apply_custom_rules(prompt, custom_rules)
 
     # Step 3: normalise whitespace
     compressed = re.sub(r"[ \t]+", " ", prompt)
@@ -82,4 +109,4 @@ def compress_prompt(
     for i, block in enumerate(code_blocks):
         compressed = compressed.replace(f"__CODE_{i}__", block)
 
-    return compressed
+    return compressed, rules_applied
