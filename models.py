@@ -144,15 +144,6 @@ class ProfileResponse(BaseModel):
 
 # ── Cache Analytics ──────────────────────────────────────────────────────────
 
-class CacheAnalyticsResponse(BaseModel):
-    total_entries: int
-    total_hits: int
-    overall_hit_rate: float
-    avg_hits_per_entry: float
-    top_entries: list[CacheTopEntry]
-    model_breakdown: list[CacheModelBreakdown]
-
-
 class CacheTopEntry(BaseModel):
     prompt_hash: str
     prompt_preview: str
@@ -167,3 +158,80 @@ class CacheModelBreakdown(BaseModel):
     entries: int
     total_hits: int
     total_tokens_saved: int
+
+
+class CacheAnalyticsResponse(BaseModel):
+    total_entries: int
+    total_hits: int
+    overall_hit_rate: float
+    avg_hits_per_entry: float
+    top_entries: list[CacheTopEntry]
+    model_breakdown: list[CacheModelBreakdown]
+
+
+# ── Cost Estimation ──────────────────────────────────────────────────────────
+
+class CostEstimateRequest(BaseModel):
+    prompt: str = Field(..., description="Prompt text to estimate cost for")
+    model: Optional[str] = Field(None, description="Specific model (or all registered)")
+
+
+class CostEstimateItem(BaseModel):
+    model: str
+    input_tokens: int
+    input_cost_usd: float
+    output_cost_usd_per_1k: float
+    total_estimate_usd: float
+
+
+class CostEstimateResponse(BaseModel):
+    input_tokens: int
+    estimates: list[CostEstimateItem]
+    cheapest_model: Optional[str]
+
+
+# ── Compression Benchmark ───────────────────────────────────────────────────
+
+class BenchmarkRequest(BaseModel):
+    prompt: str = Field(..., description="Prompt to benchmark across all profiles")
+
+
+class BenchmarkResultItem(BaseModel):
+    profile: str
+    builtin: bool
+    max_ratio: float
+    original_tokens: int
+    compressed_tokens: int
+    savings_pct: float
+    compression_ratio: float
+    compressed_preview: str
+
+
+class BenchmarkResponse(BaseModel):
+    original_tokens: int
+    profiles_tested: int
+    results: list[BenchmarkResultItem]
+    best_profile: str
+    best_savings_pct: float
+
+
+# ── Budget Tracking ──────────────────────────────────────────────────────────
+
+class BudgetSetRequest(BaseModel):
+    daily_token_limit: Optional[int] = Field(None, ge=0, description="Daily token budget (null = unlimited)")
+    monthly_token_limit: Optional[int] = Field(None, ge=0, description="Monthly token budget (null = unlimited)")
+    alert_threshold_pct: float = Field(80.0, ge=0, le=100, description="Alert when usage hits this %")
+
+
+class BudgetStatusResponse(BaseModel):
+    daily_token_limit: Optional[int]
+    monthly_token_limit: Optional[int]
+    alert_threshold_pct: float
+    daily_used: int
+    daily_remaining: Optional[int]
+    daily_pct: float
+    monthly_used: int
+    monthly_remaining: Optional[int]
+    monthly_pct: float
+    over_budget: bool
+    alerts: list[str]
