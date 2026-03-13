@@ -17,6 +17,10 @@ from models import (
     CostEstimateRequest, CostEstimateResponse,
     BenchmarkRequest, BenchmarkResponse,
     BudgetSetRequest, BudgetStatusResponse,
+    PromptTemplateCreate, PromptTemplateUpdate, PromptTemplateResponse,
+    PromptTemplateRenderRequest, PromptTemplateRenderResponse,
+    CompressionHistoryEntry, CompressionAnalytics,
+    ModelCompareRequest, ModelCompareResponse,
 )
 from compressor import compress_prompt, estimate_tokens
 from cache import (
@@ -27,6 +31,10 @@ from cache import (
     create_profile, list_profiles, get_profile, update_profile, delete_profile,
     get_cache_analytics, export_daily_csv,
     estimate_cost, benchmark_profiles, set_budget, get_budget_status,
+    create_prompt_template, list_prompt_templates, get_prompt_template,
+    update_prompt_template, delete_prompt_template, render_prompt_template,
+    list_compression_history, get_compression_analytics,
+    compare_models,
 )
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
@@ -41,8 +49,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TokenSaver",
-    description="LLM API cost optimizer: prompt compression, semantic caching, batch dedup, model cost profiles, cost estimation, compression benchmarks, budget tracking.",
-    version="0.6.0",
+    description=(
+        "LLM API cost optimizer: prompt compression, semantic caching, batch dedup, "
+        "model cost profiles, cost estimation, compression benchmarks, budget tracking, "
+        "prompt templates with variable substitution, compression history analytics, "
+        "and cross-model cost comparison."
+    ),
+    version="0.7.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -50,7 +63,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.6.0"}
+    return {"status": "ok", "version": "0.7.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
@@ -78,7 +91,10 @@ async def compress(req: CompressRequest):
     )
     compressed_tokens = estimate_tokens(compressed)
     savings_pct = round((1 - compressed_tokens / max(original_tokens, 1)) * 100, 1)
-    await record_compression(app.state.db, original_tokens, compressed_tokens)
+    await record_compression(
+        app.state.db, original_tokens, compressed_tokens,
+        profile=profile_used, prompt_preview=req.prompt[:120],
+    )
     return CompressResponse(
         original=req.prompt,
         compressed=compressed,
@@ -137,6 +153,84 @@ async def update_budget(body: BudgetSetRequest):
 async def budget_status():
     """Get current budget status: usage vs limits, alerts."""
     return await get_budget_status(app.state.db)
+
+
+# ── Prompt Templates ───────────────────────────────────────────────────────
+
+@app.post("/templates", response_model=PromptTemplateResponse, status_code=201)
+async def add_template(body: PromptTemplateCreate):
+    """Create a reusable prompt template with {{variable}} placeholders."""
+    try:
+        return await create_prompt_template(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/templates", response_model=list[PromptTemplateResponse])
+async def get_templates():
+    return await list_prompt_templates(app.state.db)
+
+
+@app.get("/templates/{tpl_id}", response_model=PromptTemplateResponse)
+async def get_template_detail(tpl_id: int):
+    tpl = await get_prompt_template(app.state.db, tpl_id)
+    if not tpl:
+        raise HTTPException(404, "Template not found")
+    return tpl
+
+
+@app.patch("/templates/{tpl_id}", response_model=PromptTemplateResponse)
+async def patch_template(tpl_id: int, body: PromptTemplateUpdate):
+    try:
+        tpl = await update_prompt_template(app.state.db, tpl_id, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if not tpl:
+        raise HTTPException(404, "Template not found")
+    return tpl
+
+
+@app.delete("/templates/{tpl_id}", status_code=204)
+async def remove_template(tpl_id: int):
+    ok = await delete_prompt_template(app.state.db, tpl_id)
+    if not ok:
+        raise HTTPException(404, "Template not found")
+
+
+@app.post("/templates/{tpl_id}/render", response_model=PromptTemplateRenderResponse)
+async def render_template(tpl_id: int, body: PromptTemplateRenderRequest):
+    """Render a template with variable substitution. Optionally compress the output."""
+    result = await render_prompt_template(
+        app.state.db, tpl_id, body.variables, body.compress, body.profile,
+    )
+    if not result:
+        raise HTTPException(404, "Template not found")
+    return result
+
+
+# ── Compression History ────────────────────────────────────────────────────
+
+@app.get("/history", response_model=list[CompressionHistoryEntry])
+async def compression_history(
+    profile: str | None = Query(None, description="Filter by compression profile"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """View recent compression operations with token counts and ratios."""
+    return await list_compression_history(app.state.db, profile, limit)
+
+
+@app.get("/history/analytics", response_model=CompressionAnalytics)
+async def compression_analytics():
+    """Aggregated compression analytics: averages, by-profile breakdown, daily trend."""
+    return await get_compression_analytics(app.state.db)
+
+
+# ── Model Comparison ───────────────────────────────────────────────────────
+
+@app.post("/compare", response_model=ModelCompareResponse)
+async def model_compare(body: ModelCompareRequest):
+    """Compare costs across all registered models for a prompt. Optionally include compressed cost."""
+    return await compare_models(app.state.db, body.prompt, body.compress, body.profile)
 
 
 # ── Compression Profiles ────────────────────────────────────────────────────
