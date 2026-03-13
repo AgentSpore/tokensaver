@@ -8,6 +8,7 @@ class CompressRequest(BaseModel):
     max_ratio: float = Field(0.5, ge=0.1, le=1.0, description="Target compression ratio (0.5 = keep 50%)")
     preserve_code: bool = Field(True, description="Preserve code blocks verbatim")
     profile: Optional[str] = Field(None, description="Named compression profile to apply (overrides max_ratio)")
+    apply_rules: bool = Field(True, description="Apply custom compression rules during compression")
 
 
 class CompressResponse(BaseModel):
@@ -18,6 +19,7 @@ class CompressResponse(BaseModel):
     savings_pct: float
     compression_ratio: float
     profile_used: Optional[str] = None
+    rules_applied: int = 0
 
 
 class CacheEntry(BaseModel):
@@ -91,6 +93,8 @@ class UsageStats(BaseModel):
     registered_models: int
     total_templates: int
     compression_history_entries: int
+    total_rules: int
+    total_quotas: int
 
 
 class CachePurgeRequest(BaseModel):
@@ -327,3 +331,72 @@ class ModelCompareResponse(BaseModel):
     results: list[ModelCompareItem]
     cheapest_model: Optional[str]
     best_savings_model: Optional[str]
+
+
+# ── Compression Rules (v0.8.0) ───────────────────────────────────────────────
+
+class CompressionRuleCreate(BaseModel):
+    pattern: str = Field(..., min_length=1, max_length=500, description="Regex pattern to match")
+    replacement: str = Field("", max_length=500, description="Replacement string (empty = remove)")
+    priority: int = Field(50, ge=0, le=100, description="Execution order: lower = earlier (0-100)")
+    description: Optional[str] = Field(None, max_length=300)
+
+
+class CompressionRuleUpdate(BaseModel):
+    pattern: Optional[str] = Field(None, min_length=1, max_length=500)
+    replacement: Optional[str] = Field(None, max_length=500)
+    priority: Optional[int] = Field(None, ge=0, le=100)
+    description: Optional[str] = Field(None, max_length=300)
+
+
+class CompressionRuleResponse(BaseModel):
+    id: int
+    pattern: str
+    replacement: str
+    priority: int
+    description: Optional[str]
+    times_applied: int
+    created_at: str
+
+
+# ── Prompt Diff (v0.8.0) ─────────────────────────────────────────────────────
+
+class PromptDiffRequest(BaseModel):
+    prompt_a: str = Field(..., min_length=1, description="First prompt")
+    prompt_b: str = Field(..., min_length=1, description="Second prompt")
+    compress: bool = Field(False, description="Also compare compressed versions")
+    profile: Optional[str] = Field(None, description="Compression profile if compress=True")
+
+
+class PromptDiffResponse(BaseModel):
+    tokens_a: int
+    tokens_b: int
+    diff_tokens: int
+    diff_pct: float
+    cheaper: str = Field(..., description="a | b | equal")
+    char_diff: int
+    compressed_tokens_a: Optional[int] = None
+    compressed_tokens_b: Optional[int] = None
+    compressed_cheaper: Optional[str] = None
+    cost_comparison: Optional[list[dict]] = None
+
+
+# ── Usage Quotas (v0.8.0) ────────────────────────────────────────────────────
+
+class UsageQuotaSet(BaseModel):
+    daily_token_limit: Optional[int] = Field(None, ge=0, description="Daily token limit for this model")
+    monthly_token_limit: Optional[int] = Field(None, ge=0, description="Monthly token limit for this model")
+
+
+class UsageQuotaResponse(BaseModel):
+    model: str
+    daily_token_limit: Optional[int]
+    monthly_token_limit: Optional[int]
+    daily_used: int
+    monthly_used: int
+    daily_pct: float
+    monthly_pct: float
+    daily_remaining: Optional[int]
+    monthly_remaining: Optional[int]
+    over_quota: bool
+    created_at: str

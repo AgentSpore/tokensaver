@@ -87,6 +87,8 @@ async def init_db(path: str) -> aiosqlite.Connection:
     await _migrate_budgets(db)
     await _migrate_prompt_templates(db)
     await _migrate_compression_history(db)
+    await _migrate_compression_rules(db)
+    await _migrate_usage_quotas(db)
     await db.commit()
     return db
 
@@ -135,6 +137,33 @@ async def _migrate_compression_history(db: aiosqlite.Connection):
     await db.execute("CREATE INDEX IF NOT EXISTS idx_comp_hist_date ON compression_history(created_at)")
 
 
+async def _migrate_compression_rules(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS compression_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern TEXT NOT NULL,
+            replacement TEXT NOT NULL DEFAULT '',
+            priority INTEGER NOT NULL DEFAULT 50,
+            description TEXT,
+            times_applied INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_rules_priority ON compression_rules(priority)")
+
+
+async def _migrate_usage_quotas(db: aiosqlite.Connection):
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS usage_quotas (
+            model TEXT PRIMARY KEY,
+            daily_token_limit INTEGER,
+            monthly_token_limit INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+
 def _hash(prompt: str, model: str = "") -> str:
     return hashlib.sha256(f"{model}:{prompt}".encode()).hexdigest()
 
@@ -168,6 +197,237 @@ async def _bump_daily(db: aiosqlite.Connection, model: str, **increments: int):
     sets = ", ".join(f"{k} = {k} + ?" for k in increments)
     vals = list(increments.values()) + [day, m]
     await db.execute(f"UPDATE daily_log SET {sets} WHERE day = ? AND model = ?", vals)
+
+
+# ── Compression Rules (v0.8.0) ──────────────────────────────────────────────
+
+async def create_compression_rule(db: aiosqlite.Connection, data: dict) -> dict:
+    import re as _re
+    try:
+        _re.compile(data["pattern"])
+    except _re.error as e:
+        raise ValueError(f"Invalid regex pattern: {e}")
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO compression_rules (pattern, replacement, priority, description, created_at) VALUES (?, ?, ?, ?, ?)",
+        (data["pattern"], data.get("replacement", ""), data.get("priority", 50), data.get("description"), now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM compression_rules WHERE id = ?", (cur.lastrowid,))
+    return _rule_row(rows[0])
+
+
+async def list_compression_rules(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM compression_rules ORDER BY priority ASC, id ASC")
+    return [_rule_row(r) for r in rows]
+
+
+async def get_compression_rule(db: aiosqlite.Connection, rule_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM compression_rules WHERE id = ?", (rule_id,))
+    return _rule_row(rows[0]) if rows else None
+
+
+async def update_compression_rule(db: aiosqlite.Connection, rule_id: int, updates: dict) -> dict | None:
+    existing = await get_compression_rule(db, rule_id)
+    if not existing:
+        return None
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return existing
+    if "pattern" in fields:
+        import re as _re
+        try:
+            _re.compile(fields["pattern"])
+        except _re.error as e:
+            raise ValueError(f"Invalid regex pattern: {e}")
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [rule_id]
+    cur = await db.execute(f"UPDATE compression_rules SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_compression_rule(db, rule_id)
+
+
+async def delete_compression_rule(db: aiosqlite.Connection, rule_id: int) -> bool:
+    cur = await db.execute("DELETE FROM compression_rules WHERE id = ?", (rule_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_active_rules(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM compression_rules ORDER BY priority ASC")
+    return [{"pattern": r["pattern"], "replacement": r["replacement"], "priority": r["priority"], "id": r["id"]} for r in rows]
+
+
+async def increment_rule_applied(db: aiosqlite.Connection, rule_ids: list[int]):
+    if not rule_ids:
+        return
+    placeholders = ",".join("?" for _ in rule_ids)
+    await db.execute(
+        f"UPDATE compression_rules SET times_applied = times_applied + 1 WHERE id IN ({placeholders})",
+        rule_ids,
+    )
+    await db.commit()
+
+
+def _rule_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"], "pattern": r["pattern"], "replacement": r["replacement"],
+        "priority": r["priority"], "description": r["description"],
+        "times_applied": r["times_applied"], "created_at": r["created_at"],
+    }
+
+
+# ── Prompt Diff (v0.8.0) ────────────────────────────────────────────────────
+
+async def prompt_diff(db: aiosqlite.Connection, prompt_a: str, prompt_b: str,
+                      compress: bool = False, profile_name: str | None = None) -> dict:
+    from compressor import estimate_tokens, compress_prompt
+
+    tokens_a = estimate_tokens(prompt_a)
+    tokens_b = estimate_tokens(prompt_b)
+    diff_tokens = abs(tokens_a - tokens_b)
+    diff_pct = round(diff_tokens / max(tokens_a, tokens_b, 1) * 100, 1)
+
+    if tokens_a < tokens_b:
+        cheaper = "a"
+    elif tokens_b < tokens_a:
+        cheaper = "b"
+    else:
+        cheaper = "equal"
+
+    result = {
+        "tokens_a": tokens_a,
+        "tokens_b": tokens_b,
+        "diff_tokens": diff_tokens,
+        "diff_pct": diff_pct,
+        "cheaper": cheaper,
+        "char_diff": abs(len(prompt_a) - len(prompt_b)),
+        "compressed_tokens_a": None,
+        "compressed_tokens_b": None,
+        "compressed_cheaper": None,
+        "cost_comparison": None,
+    }
+
+    if compress:
+        max_ratio = 0.5
+        preserve_code = True
+        strip_examples = False
+        strip_comments = False
+        if profile_name:
+            p = await get_profile(db, profile_name)
+            if p:
+                max_ratio = p["max_ratio"]
+                preserve_code = p["preserve_code"]
+                strip_examples = p["strip_examples"]
+                strip_comments = p["strip_comments"]
+        comp_a, _ = compress_prompt(prompt_a, max_ratio, preserve_code,
+                                    strip_examples=strip_examples, strip_comments=strip_comments)
+        comp_b, _ = compress_prompt(prompt_b, max_ratio, preserve_code,
+                                    strip_examples=strip_examples, strip_comments=strip_comments)
+        ct_a = estimate_tokens(comp_a)
+        ct_b = estimate_tokens(comp_b)
+        result["compressed_tokens_a"] = ct_a
+        result["compressed_tokens_b"] = ct_b
+        if ct_a < ct_b:
+            result["compressed_cheaper"] = "a"
+        elif ct_b < ct_a:
+            result["compressed_cheaper"] = "b"
+        else:
+            result["compressed_cheaper"] = "equal"
+
+        # Cost comparison across models
+        models = await list_model_costs(db)
+        if models:
+            cost_cmp = []
+            for m in models:
+                cost_a = round(ct_a * m["input_cost_per_1m"] / 1_000_000, 6)
+                cost_b = round(ct_b * m["input_cost_per_1m"] / 1_000_000, 6)
+                cost_cmp.append({
+                    "model": m["name"],
+                    "cost_a_usd": cost_a,
+                    "cost_b_usd": cost_b,
+                    "diff_usd": round(abs(cost_a - cost_b), 6),
+                })
+            result["cost_comparison"] = cost_cmp
+
+    return result
+
+
+# ── Usage Quotas (v0.8.0) ───────────────────────────────────────────────────
+
+async def set_usage_quota(db: aiosqlite.Connection, model: str,
+                          daily_limit: int | None, monthly_limit: int | None) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        """INSERT INTO usage_quotas (model, daily_token_limit, monthly_token_limit, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(model) DO UPDATE SET
+             daily_token_limit = excluded.daily_token_limit,
+             monthly_token_limit = excluded.monthly_token_limit,
+             updated_at = excluded.updated_at""",
+        (model, daily_limit, monthly_limit, now, now),
+    )
+    await db.commit()
+    return await get_usage_quota(db, model)
+
+
+async def get_usage_quota(db: aiosqlite.Connection, model: str) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM usage_quotas WHERE model = ?", (model,))
+    if not rows:
+        return None
+    r = rows[0]
+    daily_limit = r["daily_token_limit"]
+    monthly_limit = r["monthly_token_limit"]
+
+    today = _today()
+    daily_rows = await db.execute_fetchall(
+        "SELECT COALESCE(SUM(tokens_used), 0) as used FROM daily_log WHERE day = ? AND model = ?",
+        (today, model),
+    )
+    daily_used = daily_rows[0]["used"] if daily_rows else 0
+
+    month_prefix = _this_month()
+    monthly_rows = await db.execute_fetchall(
+        "SELECT COALESCE(SUM(tokens_used), 0) as used FROM daily_log WHERE day LIKE ? AND model = ?",
+        (month_prefix + "%", model),
+    )
+    monthly_used = monthly_rows[0]["used"] if monthly_rows else 0
+
+    daily_pct = round(daily_used / daily_limit * 100, 1) if daily_limit else 0.0
+    monthly_pct = round(monthly_used / monthly_limit * 100, 1) if monthly_limit else 0.0
+
+    return {
+        "model": model,
+        "daily_token_limit": daily_limit,
+        "monthly_token_limit": monthly_limit,
+        "daily_used": daily_used,
+        "monthly_used": monthly_used,
+        "daily_pct": daily_pct,
+        "monthly_pct": monthly_pct,
+        "daily_remaining": (daily_limit - daily_used) if daily_limit else None,
+        "monthly_remaining": (monthly_limit - monthly_used) if monthly_limit else None,
+        "over_quota": (daily_limit is not None and daily_used >= daily_limit) or
+                      (monthly_limit is not None and monthly_used >= monthly_limit),
+        "created_at": r["created_at"],
+    }
+
+
+async def list_usage_quotas(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT model FROM usage_quotas ORDER BY model ASC")
+    results = []
+    for r in rows:
+        q = await get_usage_quota(db, r["model"])
+        if q:
+            results.append(q)
+    return results
+
+
+async def delete_usage_quota(db: aiosqlite.Connection, model: str) -> bool:
+    cur = await db.execute("DELETE FROM usage_quotas WHERE model = ?", (model,))
+    await db.commit()
+    return cur.rowcount > 0
 
 
 # ── Compression Profiles ─────────────────────────────────────────────────────
@@ -372,6 +632,10 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     tpl_count = tpl_rows[0]["cnt"] if tpl_rows else 0
     hist_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM compression_history")
     hist_count = hist_rows[0]["cnt"] if hist_rows else 0
+    rule_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM compression_rules")
+    rule_count = rule_rows[0]["cnt"] if rule_rows else 0
+    quota_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM usage_quotas")
+    quota_count = quota_rows[0]["cnt"] if quota_rows else 0
     avg_ratio = (
         round(s["sum_compression_ratio"] / s["compression_requests"], 3)
         if s["compression_requests"] > 0 else 1.0
@@ -389,6 +653,8 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "registered_models": model_count,
         "total_templates": tpl_count,
         "compression_history_entries": hist_count,
+        "total_rules": rule_count,
+        "total_quotas": quota_count,
     }
 
 
@@ -596,7 +862,7 @@ async def benchmark_profiles(db: aiosqlite.Connection, prompt: str) -> list[dict
     original_tokens = estimate_tokens(prompt)
     results = []
     for p in profiles:
-        compressed = compress_prompt(
+        compressed, _ = compress_prompt(
             prompt, p["max_ratio"], p["preserve_code"],
             strip_examples=p["strip_examples"],
             strip_comments=p["strip_comments"],
@@ -792,8 +1058,8 @@ async def render_prompt_template(db: aiosqlite.Connection, tpl_id: int,
                 preserve_code = p["preserve_code"]
                 strip_examples = p["strip_examples"]
                 strip_comments = p["strip_comments"]
-        compressed = compress_prompt(rendered, max_ratio, preserve_code,
-                                     strip_examples=strip_examples, strip_comments=strip_comments)
+        compressed, _ = compress_prompt(rendered, max_ratio, preserve_code,
+                                        strip_examples=strip_examples, strip_comments=strip_comments)
         compressed_tokens = estimate_tokens(compressed)
         result["compressed"] = compressed
         result["compressed_tokens"] = compressed_tokens
@@ -921,8 +1187,8 @@ async def compare_models(db: aiosqlite.Connection, prompt: str,
                 preserve_code = p["preserve_code"]
                 strip_examples = p["strip_examples"]
                 strip_comments = p["strip_comments"]
-        compressed = compress_prompt(prompt, max_ratio, preserve_code,
-                                     strip_examples=strip_examples, strip_comments=strip_comments)
+        compressed, _ = compress_prompt(prompt, max_ratio, preserve_code,
+                                        strip_examples=strip_examples, strip_comments=strip_comments)
         compressed_tokens = estimate_tokens(compressed)
 
     models = await list_model_costs(db)
