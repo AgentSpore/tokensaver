@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 
 from models import (
     CompressRequest, CompressResponse,
@@ -11,6 +12,8 @@ from models import (
     UsageStats, CachePurgeRequest, CachePurgeResponse,
     DailyStatsEntry,
     ModelCostCreate, ModelCostUpdate, ModelCostResponse,
+    ProfileCreate, ProfileUpdate, ProfileResponse,
+    CacheAnalyticsResponse,
 )
 from compressor import compress_prompt, estimate_tokens
 from cache import (
@@ -18,6 +21,8 @@ from cache import (
     get_cache_entry, purge_cache, get_stats, record_compression,
     get_daily_stats,
     create_model_cost, list_model_costs, get_model_cost, update_model_cost, delete_model_cost,
+    create_profile, list_profiles, get_profile, update_profile, delete_profile,
+    get_cache_analytics, export_daily_csv,
 )
 
 DB_PATH = os.getenv("DB_PATH", "tokensaver.db")
@@ -32,8 +37,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TokenSaver",
-    description="LLM API cost optimizer: prompt compression, semantic caching, batch deduplication, model cost profiles.",
-    version="0.4.0",
+    description="LLM API cost optimizer: prompt compression with profiles, semantic caching, batch deduplication, model cost profiles, cache analytics.",
+    version="0.5.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -41,13 +46,32 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.5.0"}
 
 
 @app.post("/compress", response_model=CompressResponse)
 async def compress(req: CompressRequest):
+    profile_used = None
+    max_ratio = req.max_ratio
+    preserve_code = req.preserve_code
+    strip_examples = False
+    strip_comments = False
+
+    if req.profile:
+        p = await get_profile(app.state.db, req.profile)
+        if not p:
+            raise HTTPException(404, f"Compression profile '{req.profile}' not found")
+        max_ratio = p["max_ratio"]
+        preserve_code = p["preserve_code"]
+        strip_examples = p["strip_examples"]
+        strip_comments = p["strip_comments"]
+        profile_used = req.profile
+
     original_tokens = estimate_tokens(req.prompt)
-    compressed = compress_prompt(req.prompt, req.max_ratio, req.preserve_code)
+    compressed = compress_prompt(
+        req.prompt, max_ratio, preserve_code,
+        strip_examples=strip_examples, strip_comments=strip_comments,
+    )
     compressed_tokens = estimate_tokens(compressed)
     savings_pct = round((1 - compressed_tokens / max(original_tokens, 1)) * 100, 1)
     await record_compression(app.state.db, original_tokens, compressed_tokens)
@@ -58,7 +82,52 @@ async def compress(req: CompressRequest):
         compressed_tokens=compressed_tokens,
         savings_pct=savings_pct,
         compression_ratio=round(compressed_tokens / max(original_tokens, 1), 3),
+        profile_used=profile_used,
     )
+
+
+# ── Compression Profiles ────────────────────────────────────────────────────
+
+@app.post("/profiles", response_model=ProfileResponse, status_code=201)
+async def add_profile(body: ProfileCreate):
+    try:
+        return await create_profile(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/profiles", response_model=list[ProfileResponse])
+async def get_profiles():
+    return await list_profiles(app.state.db)
+
+
+@app.get("/profiles/{name}", response_model=ProfileResponse)
+async def get_profile_detail(name: str):
+    p = await get_profile(app.state.db, name)
+    if not p:
+        raise HTTPException(404, "Profile not found")
+    return p
+
+
+@app.patch("/profiles/{name}", response_model=ProfileResponse)
+async def patch_profile(name: str, body: ProfileUpdate):
+    try:
+        p = await update_profile(app.state.db, name, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(403, str(e))
+    if not p:
+        raise HTTPException(404, "Profile not found")
+    return p
+
+
+@app.delete("/profiles/{name}", status_code=204)
+async def remove_profile(name: str):
+    try:
+        ok = await delete_profile(app.state.db, name)
+    except ValueError as e:
+        raise HTTPException(403, str(e))
+    if not ok:
+        raise HTTPException(404, "Profile not found")
 
 
 # ── Model Cost Profiles ─────────────────────────────────────────────────────
@@ -104,6 +173,11 @@ async def remove_model(name: str):
 @app.get("/cache", response_model=list[dict])
 async def list_cache(limit: int = Query(50, ge=1, le=500)):
     return await cache_list(app.state.db, limit)
+
+
+@app.get("/cache/analytics", response_model=CacheAnalyticsResponse)
+async def cache_analytics(top: int = Query(10, ge=1, le=100)):
+    return await get_cache_analytics(app.state.db, top)
 
 
 @app.get("/cache/{prompt_hash}")
@@ -209,8 +283,18 @@ async def daily_stats(
     days: int = Query(30, ge=1, le=365, description="Look-back window in days"),
     model: str | None = Query(None, description="Filter by model name"),
 ):
-    """Daily breakdown of token usage, savings, cache performance. Uses model-specific pricing."""
     return await get_daily_stats(app.state.db, days, model)
+
+
+@app.get("/stats/daily/csv")
+async def daily_stats_csv(
+    days: int = Query(90, ge=1, le=365),
+    model: str | None = Query(None),
+):
+    csv_content = await export_daily_csv(app.state.db, days, model)
+    return PlainTextResponse(csv_content, media_type="text/csv", headers={
+        "Content-Disposition": "attachment; filename=tokensaver_daily_stats.csv",
+    })
 
 
 @app.get("/stats", response_model=UsageStats)
