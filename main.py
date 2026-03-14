@@ -1,7 +1,8 @@
-"""TokenSaver v1.0.0 — FastAPI main application.
+"""TokenSaver v1.1.0 — FastAPI main application.
 
 LLM API cost optimization platform: compression, caching, cost estimation,
-benchmarking, A/B testing, templates, alerts, playground, forecasting, chains.
+benchmarking, A/B testing, templates, alerts, playground, forecasting, chains,
+heatmaps, prompt versioning, cost allocation tags.
 """
 
 from __future__ import annotations
@@ -99,13 +100,26 @@ from models import (
     ChainResponse,
     ChainRunRequest,
     ChainRunResponse,
+    # Token Usage Heatmap (NEW v1.1.0)
+    HeatmapResponse,
+    PeakAnalysis,
+    # Prompt Versioning (NEW v1.1.0)
+    PromptVersionCreate,
+    PromptVersionUpdate,
+    PromptVersionResponse,
+    PromptVersionDiff,
+    # Cost Allocation Tags (NEW v1.1.0)
+    CostTagCreate,
+    CostTagUpdate,
+    CostTagResponse,
+    CostTagAllocation,
 )
 
 # ── Application ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="TokenSaver",
-    version="1.0.0",
+    version="1.1.0",
     description="LLM API cost optimization platform — compression, caching, cost analytics.",
 )
 
@@ -135,7 +149,7 @@ async def shutdown() -> None:
 
 @app.get("/health", tags=["health"])
 async def health() -> dict:
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "1.1.0"}
 
 
 # ── Compression ───────────────────────────────────────────────────────────────
@@ -1408,6 +1422,301 @@ async def find_optimal_chain(
     try:
         result = await cache.find_optimal_chain(db, prompt, max_steps=max_steps)
         return ChainRunResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW v1.1.0: Token Usage Heatmap
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/heatmap", response_model=HeatmapResponse, tags=["heatmap"])
+async def get_usage_heatmap(
+    request: Request,
+    days: int = Query(7, ge=1, le=90),
+    model: Optional[str] = None,
+) -> HeatmapResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.get_usage_heatmap(db, days=days, model=model)
+        return HeatmapResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/heatmap/peaks", response_model=PeakAnalysis, tags=["heatmap"])
+async def get_peak_analysis(
+    request: Request,
+    days: int = Query(7, ge=1, le=90),
+) -> PeakAnalysis:
+    db = request.app.state.db
+    try:
+        result = await cache.get_peak_analysis(db, days=days)
+        return PeakAnalysis(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW v1.1.0: Prompt Versioning
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Register non-parameterized routes BEFORE parameterized ones
+
+@app.get("/prompts/diff", response_model=PromptVersionDiff, tags=["prompts"])
+async def diff_prompt_versions(
+    request: Request,
+    version_a: int = Query(..., description="First prompt version ID"),
+    version_b: int = Query(..., description="Second prompt version ID"),
+) -> PromptVersionDiff:
+    db = request.app.state.db
+    try:
+        result = await cache.diff_prompt_versions(db, version_a, version_b)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Prompt version(s) not found")
+        return PromptVersionDiff(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post(
+    "/prompts",
+    response_model=PromptVersionResponse,
+    status_code=201,
+    tags=["prompts"],
+)
+async def create_prompt_version(
+    request: Request, body: PromptVersionCreate
+) -> PromptVersionResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.create_prompt_version(db, body.model_dump())
+        return PromptVersionResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/prompts", response_model=list[PromptVersionResponse], tags=["prompts"])
+async def list_prompt_versions(
+    request: Request,
+    name: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[PromptVersionResponse]:
+    db = request.app.state.db
+    try:
+        rows = await cache.list_prompt_versions(db, name=name, limit=limit, offset=offset)
+        return [PromptVersionResponse(**r) for r in rows]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get(
+    "/prompts/{prompt_id}",
+    response_model=PromptVersionResponse,
+    tags=["prompts"],
+)
+async def get_prompt_version(request: Request, prompt_id: int) -> PromptVersionResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.get_prompt_version(db, prompt_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Prompt version not found")
+        return PromptVersionResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.put(
+    "/prompts/{prompt_id}",
+    response_model=PromptVersionResponse,
+    tags=["prompts"],
+)
+async def update_prompt_version(
+    request: Request, prompt_id: int, body: PromptVersionUpdate
+) -> PromptVersionResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.update_prompt_version(
+            db, prompt_id, body.model_dump(exclude_none=True)
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="Prompt version not found")
+        return PromptVersionResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/prompts/{prompt_id}", status_code=204, tags=["prompts"])
+async def delete_prompt_version(request: Request, prompt_id: int) -> Response:
+    db = request.app.state.db
+    try:
+        deleted = await cache.delete_prompt_version(db, prompt_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Prompt version not found")
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get(
+    "/prompts/{prompt_id}/history",
+    response_model=list[PromptVersionResponse],
+    tags=["prompts"],
+)
+async def list_prompt_history(
+    request: Request, prompt_id: int
+) -> list[PromptVersionResponse]:
+    db = request.app.state.db
+    try:
+        rows = await cache.list_prompt_history(db, prompt_id)
+        if rows is None:
+            raise HTTPException(status_code=404, detail="Prompt version not found")
+        return [PromptVersionResponse(**r) for r in rows]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post(
+    "/prompts/{prompt_id}/use",
+    response_model=PromptVersionResponse,
+    tags=["prompts"],
+)
+async def use_prompt_version(request: Request, prompt_id: int) -> PromptVersionResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.use_prompt_version(db, prompt_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Prompt version not found")
+        return PromptVersionResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW v1.1.0: Cost Allocation Tags
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Register non-parameterized routes BEFORE parameterized ones
+
+@app.get("/cost-tags/breakdown", response_model=CostTagAllocation, tags=["cost-tags"])
+async def get_cost_tag_breakdown(
+    request: Request,
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+) -> CostTagAllocation:
+    db = request.app.state.db
+    try:
+        result = await cache.get_cost_tag_breakdown(db, from_date=from_date, to_date=to_date)
+        return CostTagAllocation(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post(
+    "/cost-tags",
+    response_model=CostTagResponse,
+    status_code=201,
+    tags=["cost-tags"],
+)
+async def create_cost_tag(request: Request, body: CostTagCreate) -> CostTagResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.create_cost_tag(db, body.model_dump())
+        return CostTagResponse(**result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/cost-tags", response_model=list[CostTagResponse], tags=["cost-tags"])
+async def list_cost_tags(request: Request) -> list[CostTagResponse]:
+    db = request.app.state.db
+    try:
+        rows = await cache.list_cost_tags(db)
+        return [CostTagResponse(**r) for r in rows]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get(
+    "/cost-tags/{tag_id}",
+    response_model=CostTagResponse,
+    tags=["cost-tags"],
+)
+async def get_cost_tag(request: Request, tag_id: int) -> CostTagResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.get_cost_tag(db, tag_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Cost tag not found")
+        return CostTagResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.patch(
+    "/cost-tags/{tag_id}",
+    response_model=CostTagResponse,
+    tags=["cost-tags"],
+)
+async def update_cost_tag(
+    request: Request, tag_id: int, body: CostTagUpdate
+) -> CostTagResponse:
+    db = request.app.state.db
+    try:
+        result = await cache.update_cost_tag(db, tag_id, body.model_dump(exclude_none=True))
+        if result is None:
+            raise HTTPException(status_code=404, detail="Cost tag not found")
+        return CostTagResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/cost-tags/{tag_id}", status_code=204, tags=["cost-tags"])
+async def delete_cost_tag(request: Request, tag_id: int) -> Response:
+    db = request.app.state.db
+    try:
+        deleted = await cache.delete_cost_tag(db, tag_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Cost tag not found")
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/cost-tags/{tag_id}/allocate", status_code=201, tags=["cost-tags"])
+async def allocate_cost_to_tag(
+    request: Request,
+    tag_id: int,
+    compression_id: int = Query(..., description="Compression record ID to allocate"),
+) -> dict:
+    db = request.app.state.db
+    try:
+        result = await cache.allocate_cost(db, tag_id, compression_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Cost tag or compression not found")
+        return result
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
