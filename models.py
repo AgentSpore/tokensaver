@@ -1,4 +1,4 @@
-"""TokenSaver v1.0.0 — Pydantic models for LLM cost optimization."""
+"""TokenSaver v1.1.0 — Pydantic models for LLM cost optimization."""
 
 from __future__ import annotations
 
@@ -617,3 +617,109 @@ class ChainRunResponse(BaseModel):
     final_ratio: float
     step_results: list[dict]
     total_rules_applied: int
+
+
+# ── Token Usage Heatmap (NEW v1.1.0) ────────────────────────────────────────
+
+class HeatmapRequest(BaseModel):
+    days: int = Field(default=7, ge=1, le=90)
+    model: Optional[str] = None
+
+
+class HeatmapCell(BaseModel):
+    hour: int
+    day: str
+    requests: int
+    tokens: int
+    cost_usd: float
+
+
+class HeatmapResponse(BaseModel):
+    cells: list[HeatmapCell]
+    peak_hour: int
+    peak_day: str
+    total_requests: int
+    model_distribution: dict
+
+
+class PeakAnalysis(BaseModel):
+    peak_hours: list[dict]
+    quiet_hours: list[dict]
+    recommendation: str
+
+
+# ── Prompt Versioning (NEW v1.1.0) ──────────────────────────────────────────
+
+class PromptVersionCreate(BaseModel):
+    name: str
+    prompt_text: str
+    model: Optional[str] = None
+    tags: Optional[list[str]] = None
+    notes: Optional[str] = None
+
+
+class PromptVersionUpdate(BaseModel):
+    prompt_text: Optional[str] = None
+    tags: Optional[list[str]] = None
+    notes: Optional[str] = None
+
+
+class PromptVersionResponse(BaseModel):
+    id: int
+    name: str
+    version: int
+    prompt_text: str
+    model: Optional[str]
+    tags: list[str]
+    notes: Optional[str]
+    token_count: int
+    times_used: int
+    avg_cost: float
+    created_at: str
+
+
+class PromptVersionDiff(BaseModel):
+    version_a: int
+    version_b: int
+    token_diff: int
+    text_diff: str
+
+
+# ── Cost Allocation Tags (NEW v1.1.0) ───────────────────────────────────────
+
+class CostTagCreate(BaseModel):
+    tag: str
+    description: Optional[str] = None
+    budget_usd: Optional[float] = Field(default=None, ge=0)
+
+
+class CostTagUpdate(BaseModel):
+    description: Optional[str] = None
+    budget_usd: Optional[float] = Field(default=None, ge=0)
+
+
+class CostTagResponse(BaseModel):
+    id: int
+    tag: str
+    description: Optional[str]
+    budget_usd: Optional[float]
+    total_spent: float
+    request_count: int
+    created_at: str
+
+
+class CostTagBreakdown(BaseModel):
+    tag: str
+    total_cost: float
+    request_count: int
+    avg_cost_per_request: float
+    top_models: list[dict]
+    budget_usd: Optional[float]
+    budget_remaining: Optional[float]
+    pct_used: Optional[float]
+
+
+class CostTagAllocation(BaseModel):
+    tags: list[CostTagBreakdown]
+    untagged_cost: float
+    total_cost: float
