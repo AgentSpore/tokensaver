@@ -1,10 +1,11 @@
-"""TokenSaver v1.0.0 — Database & business logic (aiosqlite).
+"""TokenSaver v1.1.0 — Database & business logic (aiosqlite).
 
 All async functions for: compression, cache, profiles, model costs,
 statistics, budget, templates, cost estimation, benchmarking,
 model comparison, batch processing, compression rules, prompt diff,
 usage quotas, cost alerts, A/B testing, prompt playground,
-cost forecasting, and compression chains.
+cost forecasting, compression chains, usage heatmaps, prompt versions,
+and cost tags.
 """
 
 from __future__ import annotations
@@ -303,6 +304,54 @@ async def init_db(db: aiosqlite.Connection) -> None:
         profile_name TEXT NOT NULL,
         FOREIGN KEY (chain_id) REFERENCES compression_chains(id)
     );
+
+    -- Usage heatmap (NEW v1.1.0)
+    CREATE TABLE IF NOT EXISTS usage_heatmap (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hour INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT 'default',
+        requests INTEGER NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL NOT NULL DEFAULT 0.0,
+        UNIQUE(hour, date, model)
+    );
+
+    -- Prompt versions (NEW v1.1.0)
+    CREATE TABLE IF NOT EXISTS prompt_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        prompt_text TEXT NOT NULL,
+        model TEXT,
+        tags TEXT NOT NULL DEFAULT '[]',
+        notes TEXT,
+        token_count INTEGER NOT NULL DEFAULT 0,
+        times_used INTEGER NOT NULL DEFAULT 0,
+        total_cost REAL NOT NULL DEFAULT 0.0,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_prompt_versions_name ON prompt_versions(name);
+
+    -- Cost tags (NEW v1.1.0)
+    CREATE TABLE IF NOT EXISTS cost_tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tag TEXT UNIQUE NOT NULL,
+        description TEXT,
+        budget_usd REAL,
+        created_at TEXT NOT NULL
+    );
+
+    -- Cost tag usage (NEW v1.1.0)
+    CREATE TABLE IF NOT EXISTS cost_tag_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tag_id INTEGER NOT NULL REFERENCES cost_tags(id),
+        compression_id INTEGER REFERENCES compression_log(id),
+        cost_usd REAL NOT NULL DEFAULT 0.0,
+        model TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cost_tag_usage_tag ON cost_tag_usage(tag_id);
     """)
 
     # Seed builtin profiles
@@ -723,6 +772,26 @@ async def delete_model_cost(db: aiosqlite.Connection, model: str) -> bool:
     return cur.rowcount > 0
 
 
+# ── Row Helpers (v1.1.0) ────────────────────────────────────────────────────
+
+def _heatmap_row(row):
+    return {"id": row["id"], "hour": row["hour"], "date": row["date"], "model": row["model"],
+            "requests": row["requests"], "tokens": row["tokens"], "cost_usd": row["cost_usd"]}
+
+def _prompt_version_row(row):
+    return {"id": row["id"], "name": row["name"], "version": row["version"],
+            "prompt_text": row["prompt_text"], "model": row["model"],
+            "tags": json.loads(row["tags"]) if isinstance(row["tags"], str) else row["tags"],
+            "notes": row["notes"], "token_count": row["token_count"],
+            "times_used": row["times_used"],
+            "avg_cost": round(row["total_cost"] / max(1, row["times_used"]), 6),
+            "created_at": row["created_at"]}
+
+def _cost_tag_row(row):
+    return {"id": row["id"], "tag": row["tag"], "description": row["description"],
+            "budget_usd": row["budget_usd"], "created_at": row["created_at"]}
+
+
 # ── Statistics ───────────────────────────────────────────────────────────────
 
 async def get_stats(db: aiosqlite.Connection) -> dict:
@@ -765,6 +834,13 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     )
     top_models = [_row_to_dict(r) for r in model_rows]
 
+    # v1.1.0: total prompt versions & cost tags
+    pv_rows = await db.execute_fetchall("SELECT COUNT(*) as c FROM prompt_versions")
+    total_prompt_versions = _row_to_dict(pv_rows[0])["c"]
+
+    ct_rows = await db.execute_fetchall("SELECT COUNT(*) as c FROM cost_tags")
+    total_cost_tags = _row_to_dict(ct_rows[0])["c"]
+
     return {
         "total_requests": s["total_requests"],
         "total_tokens_in": s["total_tokens_in"],
@@ -777,6 +853,8 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "cache_hit_rate": hit_rate,
         "avg_compression_ratio": avg_ratio,
         "top_models": top_models,
+        "total_prompt_versions": total_prompt_versions,
+        "total_cost_tags": total_cost_tags,
     }
 
 
@@ -2365,3 +2443,437 @@ async def _get_chain_steps(db: aiosqlite.Connection, chain_id: int) -> list[str]
         (chain_id,),
     )
     return [_row_to_dict(r)["profile_name"] for r in rows]
+
+
+# --- v1.1.0 new functions below ---
+
+
+# ── Usage Heatmap ─────────────────────────────────────────────────────────────
+
+
+async def record_heatmap(db, model: str, tokens: int, cost_usd: float):
+    """Record a usage data point for the heatmap (hour × date × model)."""
+    now = datetime.utcnow()
+    hour = now.hour
+    date = now.strftime("%Y-%m-%d")
+    r = await db.execute(
+        "SELECT id, requests, tokens, cost_usd FROM usage_heatmap "
+        "WHERE hour=? AND date=? AND model=?",
+        (hour, date, model),
+    )
+    existing = await r.fetchone()
+    if existing:
+        await db.execute(
+            "UPDATE usage_heatmap SET requests=requests+1, tokens=tokens+?, "
+            "cost_usd=cost_usd+? WHERE id=?",
+            (tokens, cost_usd, existing["id"]),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO usage_heatmap (hour, date, model, requests, tokens, cost_usd) "
+            "VALUES (?,?,?,1,?,?)",
+            (hour, date, model, tokens, cost_usd),
+        )
+    await db.commit()
+
+
+async def get_usage_heatmap(db, days: int = 7, model: str = None):
+    """Return heatmap cells with peak/distribution metadata."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    if model:
+        r = await db.execute(
+            "SELECT * FROM usage_heatmap WHERE date >= ? AND model=? ORDER BY date, hour",
+            (cutoff, model),
+        )
+    else:
+        r = await db.execute(
+            "SELECT * FROM usage_heatmap WHERE date >= ? ORDER BY date, hour",
+            (cutoff,),
+        )
+    rows = await r.fetchall()
+    cells = [
+        {
+            "hour": row["hour"],
+            "day": row["date"],
+            "requests": row["requests"],
+            "tokens": row["tokens"],
+            "cost_usd": round(row["cost_usd"], 6),
+        }
+        for row in rows
+    ]
+    peak_hour, peak_day = 0, ""
+    max_requests = 0
+    total_requests = 0
+    model_dist: dict[str, int] = {}
+    for row in rows:
+        total_requests += row["requests"]
+        if row["requests"] > max_requests:
+            max_requests = row["requests"]
+            peak_hour = row["hour"]
+            peak_day = row["date"]
+        m = row["model"]
+        model_dist[m] = model_dist.get(m, 0) + row["requests"]
+    return {
+        "cells": cells,
+        "peak_hour": peak_hour,
+        "peak_day": peak_day,
+        "total_requests": total_requests,
+        "model_distribution": model_dist,
+    }
+
+
+async def get_peak_analysis(db, days: int = 7):
+    """Analyse peak vs quiet hours over the given window."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    r = await db.execute(
+        "SELECT hour, SUM(requests) as total FROM usage_heatmap "
+        "WHERE date >= ? GROUP BY hour ORDER BY total DESC",
+        (cutoff,),
+    )
+    rows = await r.fetchall()
+    hourly = {row["hour"]: row["total"] for row in rows}  # noqa: F841
+    peak_hours = [{"hour": row["hour"], "requests": row["total"]} for row in rows[:3]]
+    quiet_hours = (
+        [{"hour": row["hour"], "requests": row["total"]} for row in rows[-3:]]
+        if len(rows) >= 3
+        else []
+    )
+    if peak_hours:
+        rec = (
+            f"Peak usage at hour {peak_hours[0]['hour']}:00 UTC. "
+            "Consider scheduling batch jobs during quiet hours."
+        )
+    else:
+        rec = "Not enough data for analysis."
+    return {
+        "peak_hours": peak_hours,
+        "quiet_hours": quiet_hours,
+        "recommendation": rec,
+    }
+
+
+# ── Prompt Versioning ─────────────────────────────────────────────────────────
+
+
+async def create_prompt_version(db, data):
+    """Create the first version of a named prompt."""
+    from compressor import estimate_tokens
+
+    now = _now()
+    token_count = estimate_tokens(data["prompt_text"])
+    tags = json.dumps(data.get("tags", []))
+    r = await db.execute(
+        "INSERT INTO prompt_versions "
+        "(name, version, prompt_text, model, tags, notes, token_count, created_at) "
+        "VALUES (?,1,?,?,?,?,?,?)",
+        (
+            data["name"],
+            data["prompt_text"],
+            data.get("model"),
+            tags,
+            data.get("notes"),
+            token_count,
+            now,
+        ),
+    )
+    await db.commit()
+    return await get_prompt_version(db, r.lastrowid)
+
+
+async def list_prompt_versions(db, name=None, limit=50, offset=0):
+    """List prompt versions — all versions for a name, or latest of each."""
+    if name:
+        r = await db.execute(
+            "SELECT * FROM prompt_versions WHERE name=? "
+            "ORDER BY version DESC LIMIT ? OFFSET ?",
+            (name, limit, offset),
+        )
+    else:
+        # Get latest version of each name
+        r = await db.execute(
+            """
+            SELECT pv.* FROM prompt_versions pv
+            INNER JOIN (
+                SELECT name, MAX(version) as max_v
+                FROM prompt_versions GROUP BY name
+            ) latest
+            ON pv.name = latest.name AND pv.version = latest.max_v
+            ORDER BY pv.created_at DESC LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+    return [_prompt_version_row(row) for row in await r.fetchall()]
+
+
+async def get_prompt_version(db, prompt_id):
+    """Fetch a single prompt version by ID."""
+    r = await db.execute("SELECT * FROM prompt_versions WHERE id=?", (prompt_id,))
+    row = await r.fetchone()
+    return _prompt_version_row(row) if row else None
+
+
+async def update_prompt_version(db, prompt_id, **kwargs):
+    """Create a new version of an existing prompt (immutable versioning)."""
+    from compressor import estimate_tokens
+
+    current = await get_prompt_version(db, prompt_id)
+    if not current:
+        return None
+    new_text = kwargs.get("prompt_text", current["prompt_text"])
+    new_tags = json.dumps(kwargs.get("tags", current["tags"]))
+    new_notes = kwargs.get("notes", current["notes"])
+    token_count = estimate_tokens(new_text)
+    now = _now()
+    max_r = await db.execute(
+        "SELECT MAX(version) FROM prompt_versions WHERE name=?",
+        (current["name"],),
+    )
+    max_v = (await max_r.fetchone())[0] or 0
+    r = await db.execute(
+        "INSERT INTO prompt_versions "
+        "(name, version, prompt_text, model, tags, notes, token_count, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (
+            current["name"],
+            max_v + 1,
+            new_text,
+            current["model"],
+            new_tags,
+            new_notes,
+            token_count,
+            now,
+        ),
+    )
+    await db.commit()
+    return await get_prompt_version(db, r.lastrowid)
+
+
+async def delete_prompt_version(db, prompt_id):
+    """Delete a single prompt version by ID."""
+    r = await db.execute("DELETE FROM prompt_versions WHERE id=?", (prompt_id,))
+    await db.commit()
+    return r.rowcount > 0
+
+
+async def list_prompt_history(db, prompt_id):
+    """Return full version history for the prompt that owns *prompt_id*."""
+    current = await get_prompt_version(db, prompt_id)
+    if not current:
+        return None
+    r = await db.execute(
+        "SELECT * FROM prompt_versions WHERE name=? ORDER BY version ASC",
+        (current["name"],),
+    )
+    return [_prompt_version_row(row) for row in await r.fetchall()]
+
+
+async def diff_prompt_versions(db, version_a_id, version_b_id):
+    """Unified diff between two prompt versions."""
+    a = await get_prompt_version(db, version_a_id)
+    b = await get_prompt_version(db, version_b_id)
+    if not a or not b:
+        return None
+    import difflib
+
+    diff_lines = list(
+        difflib.unified_diff(
+            a["prompt_text"].splitlines(keepends=True),
+            b["prompt_text"].splitlines(keepends=True),
+            fromfile=f"v{a['version']}",
+            tofile=f"v{b['version']}",
+        )
+    )
+    return {
+        "version_a": a["version"],
+        "version_b": b["version"],
+        "token_diff": b["token_count"] - a["token_count"],
+        "text_diff": "".join(diff_lines),
+    }
+
+
+async def use_prompt_version(db, prompt_id):
+    """Increment the usage counter for a prompt version."""
+    pv = await get_prompt_version(db, prompt_id)
+    if not pv:
+        return None
+    await db.execute(
+        "UPDATE prompt_versions SET times_used=times_used+1 WHERE id=?",
+        (prompt_id,),
+    )
+    await db.commit()
+    return await get_prompt_version(db, prompt_id)
+
+
+# ── Cost Allocation Tags ─────────────────────────────────────────────────────
+
+
+async def create_cost_tag(db, data):
+    """Create a new cost-allocation tag (unique name enforced)."""
+    now = _now()
+    try:
+        r = await db.execute(
+            "INSERT INTO cost_tags (tag, description, budget_usd, created_at) "
+            "VALUES (?,?,?,?)",
+            (data["tag"], data.get("description"), data.get("budget_usd"), now),
+        )
+        await db.commit()
+        return await get_cost_tag(db, r.lastrowid)
+    except Exception:
+        raise ValueError(f"Tag '{data['tag']}' already exists")
+
+
+async def list_cost_tags(db):
+    """List all cost tags with aggregated spend info."""
+    r = await db.execute("SELECT * FROM cost_tags ORDER BY tag ASC")
+    results = []
+    for row in await r.fetchall():
+        tag = _cost_tag_row(row)
+        agg = await db.execute(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(cost_usd),0) as total "
+            "FROM cost_tag_usage WHERE tag_id=?",
+            (row["id"],),
+        )
+        agg_row = await agg.fetchone()
+        tag["total_spent"] = round(agg_row["total"], 6)
+        tag["request_count"] = agg_row["cnt"]
+        results.append(tag)
+    return results
+
+
+async def get_cost_tag(db, tag_id):
+    """Fetch a cost tag by ID with aggregated usage."""
+    r = await db.execute("SELECT * FROM cost_tags WHERE id=?", (tag_id,))
+    row = await r.fetchone()
+    if not row:
+        return None
+    tag = _cost_tag_row(row)
+    agg = await db.execute(
+        "SELECT COUNT(*) as cnt, COALESCE(SUM(cost_usd),0) as total "
+        "FROM cost_tag_usage WHERE tag_id=?",
+        (tag_id,),
+    )
+    agg_row = await agg.fetchone()
+    tag["total_spent"] = round(agg_row["total"], 6)
+    tag["request_count"] = agg_row["cnt"]
+    return tag
+
+
+async def update_cost_tag(db, tag_id, **kwargs):
+    """Update mutable fields (description, budget) on a cost tag."""
+    tag = await get_cost_tag(db, tag_id)
+    if not tag:
+        return None
+    sets, vals = [], []
+    if "description" in kwargs:
+        sets.append("description=?")
+        vals.append(kwargs["description"])
+    if "budget_usd" in kwargs:
+        sets.append("budget_usd=?")
+        vals.append(kwargs["budget_usd"])
+    if not sets:
+        return tag
+    vals.append(tag_id)
+    await db.execute(
+        f"UPDATE cost_tags SET {','.join(sets)} WHERE id=?", vals
+    )
+    await db.commit()
+    return await get_cost_tag(db, tag_id)
+
+
+async def delete_cost_tag(db, tag_id):
+    """Delete a cost tag and its usage records."""
+    await db.execute("DELETE FROM cost_tag_usage WHERE tag_id=?", (tag_id,))
+    r = await db.execute("DELETE FROM cost_tags WHERE id=?", (tag_id,))
+    await db.commit()
+    return r.rowcount > 0
+
+
+async def allocate_cost(db, tag_id, compression_id):
+    """Link a compression-log entry's cost to a tag."""
+    tag = await get_cost_tag(db, tag_id)
+    if not tag:
+        return None
+    r = await db.execute(
+        "SELECT * FROM compression_log WHERE id=?", (compression_id,)
+    )
+    comp = await r.fetchone()
+    if not comp:
+        return None
+    now = _now()
+    cost = comp["original_cost"] if comp["original_cost"] else 0.0
+    model = comp["model"] if "model" in comp.keys() else "unknown"
+    await db.execute(
+        "INSERT INTO cost_tag_usage "
+        "(tag_id, compression_id, cost_usd, model, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (tag_id, compression_id, cost, model, now),
+    )
+    await db.commit()
+    return await get_cost_tag(db, tag_id)
+
+
+async def get_cost_tag_breakdown(db, from_date=None, to_date=None):
+    """Full breakdown of spend by tag, including untagged remainder."""
+    tags = await db.execute("SELECT * FROM cost_tags ORDER BY tag")
+    tag_rows = await tags.fetchall()
+    breakdowns = []
+    total_tagged = 0.0
+    for row in tag_rows:
+        clauses = ["tag_id=?"]
+        vals: list[Any] = [row["id"]]
+        if from_date:
+            clauses.append("created_at >= ?")
+            vals.append(from_date)
+        if to_date:
+            clauses.append("created_at <= ?")
+            vals.append(to_date)
+        where = " AND ".join(clauses)
+        agg = await db.execute(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(cost_usd),0) as total "
+            f"FROM cost_tag_usage WHERE {where}",
+            vals,
+        )
+        agg_row = await agg.fetchone()
+        total_cost = round(agg_row["total"], 6)
+        total_tagged += total_cost
+        req_count = agg_row["cnt"]
+        # top models
+        models_r = await db.execute(
+            f"SELECT model, COUNT(*) as cnt, SUM(cost_usd) as cost "
+            f"FROM cost_tag_usage WHERE {where} "
+            f"GROUP BY model ORDER BY cost DESC LIMIT 5",
+            vals,
+        )
+        top_models = [
+            {"model": m["model"], "count": m["cnt"], "cost": round(m["cost"], 6)}
+            for m in await models_r.fetchall()
+        ]
+        bd: dict[str, Any] = {
+            "tag": row["tag"],
+            "total_cost": total_cost,
+            "request_count": req_count,
+            "avg_cost_per_request": round(total_cost / max(1, req_count), 6),
+            "top_models": top_models,
+            "budget_usd": row["budget_usd"],
+        }
+        if row["budget_usd"]:
+            bd["budget_remaining"] = round(row["budget_usd"] - total_cost, 6)
+            bd["pct_used"] = (
+                round(total_cost / row["budget_usd"] * 100, 1)
+                if row["budget_usd"] > 0
+                else 0.0
+            )
+        else:
+            bd["budget_remaining"] = None
+            bd["pct_used"] = None
+        breakdowns.append(bd)
+    # untagged
+    total_r = await db.execute(
+        "SELECT COALESCE(SUM(original_cost),0) as total FROM compression_log"
+    )
+    total_all = round((await total_r.fetchone())["total"], 6)
+    return {
+        "tags": breakdowns,
+        "untagged_cost": round(total_all - total_tagged, 6),
+        "total_cost": total_all,
+    }
