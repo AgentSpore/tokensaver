@@ -1,3 +1,4 @@
+import os
 """TokenSaver v1.1.0 — FastAPI main application.
 
 LLM API cost optimization platform: compression, caching, cost estimation,
@@ -150,7 +151,7 @@ async def serve_ui():
 
 @app.on_event("startup")
 async def startup() -> None:
-    db = await aiosqlite.connect("tokensaver.db")
+    db = await aiosqlite.connect(os.environ.get("DB_PATH", "tokensaver.db"))
     await cache.init_db(db)
     app.state.db = db
 
