@@ -1,1 +1,10 @@
-RlJPTSBweXRob246My4xMS1zbGltCgpXT1JLRElSIC9hcHAKCkNPUFkgcmVxdWlyZW1lbnRzLnR4dCAuClJVTiBwaXAgaW5zdGFsbCAtLW5vLWNhY2hlLWRpciAtciByZXF1aXJlbWVudHMudHh0CgpDT1BZIC4gLgoKRVhQT1NFIDgwMDAKCkNNRCBbInV2aWNvcm4iLCAibWFpbjphcHAiLCAiLS1ob3N0IiwgIjAuMC4wLjAiLCAiLS1wb3J0IiwgIjgwMDAiXQo=
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install uv
+COPY pyproject.toml .python-version* ./
+RUN uv sync --no-dev
+COPY . .
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
