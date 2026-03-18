@@ -404,7 +404,7 @@ async def compress(db: aiosqlite.Connection, prompt: str, profile: str = "balanc
 
     # Compress with compressor
     aggressiveness = profile_settings["aggressiveness"] if profile_settings else 0.5
-    compressed = compress_prompt(text, aggressiveness=aggressiveness)
+    compressed, _ = compress_prompt(text, max_ratio=aggressiveness)
 
     original_tokens = estimate_tokens(prompt)
     compressed_tokens = estimate_tokens(compressed)
